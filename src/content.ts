@@ -97,7 +97,19 @@ interface Controls {
   rate: HTMLButtonElement;
   faster: HTMLButtonElement;
   eta: HTMLSpanElement;
+  buffer: HTMLSpanElement;
 }
+
+/** Published by page.ts (which runs in the page's world) through a data attribute on <html>. */
+interface BufferStatus {
+  active: boolean;
+  goal: number | null;
+  wanted: number;
+  how: string;
+  version: string | null;
+}
+
+const BUFFER_STATUS_DATASET_KEY = "ivysilaniExtBuffer";
 
 let video: HTMLVideoElement | null = null;
 let controls: Controls | null = null;
@@ -118,7 +130,11 @@ let resumeGuard: { remembered: number; until: number; reported: boolean } | null
 /** Set when the user clicks the player's "live" button while paused. */
 let userWentLive = false;
 
-/** Ticks the pause-budget countdown while a live stream is paused. */
+/**
+ * While the video is paused no timeupdate events arrive, yet the pause-budget
+ * countdown keeps moving and the player keeps filling its buffer, so a
+ * one-second ticker refreshes those labels instead.
+ */
 let pauseTicker: number | null = null;
 
 function area(el: Element): number {
@@ -298,8 +314,11 @@ function pauseBudget(v: HTMLVideoElement): number | null {
 }
 
 function startPauseTicker(): void {
-  stopPauseTicker();
-  pauseTicker = window.setInterval(renderEta, 1000);
+  if (pauseTicker !== null) return;
+  pauseTicker = window.setInterval(() => {
+    renderEta();
+    renderBuffer();
+  }, 1000);
 }
 
 function stopPauseTicker(): void {
@@ -322,7 +341,6 @@ function onLivePause(): void {
   resumeGuard = null;
   userWentLive = false;
   console.info(`${LOG_PREFIX} paused live stream: ${describe(video)}`);
-  startPauseTicker();
 }
 
 /** 'seeking' while paused: the user moved the slider, so that is the new remembered position. */
@@ -333,7 +351,6 @@ function onLiveSeeking(): void {
 
 /** 'play': arm the guard with the remembered position and log what the resume starts from. */
 function onLivePlay(): void {
-  stopPauseTicker();
   if (!video || pausedAt === null || !isLive(video)) return;
   const elapsed = Math.round((Date.now() - pausedWall) / 1000);
   console.info(`${LOG_PREFIX} resuming after ${elapsed} s: remembered ${pausedAt.toFixed(1)} s, ${describe(video)}`);
@@ -452,8 +469,12 @@ function createControls(): Controls {
   eta.style.cssText = LABEL_STYLE;
   setDisplay(eta, "none");
 
-  bar.append(playPause, speedGroup, eta);
-  return { bar, playPause, speedGroup, slower, rate, faster, eta };
+  const buffer = document.createElement("span");
+  buffer.style.cssText = LABEL_STYLE;
+  setDisplay(buffer, "none");
+
+  bar.append(playPause, speedGroup, eta, buffer);
+  return { bar, playPause, speedGroup, slower, rate, faster, eta, buffer };
 }
 
 // Only touch the DOM when something changed, so our own updates don't
@@ -491,6 +512,9 @@ function render(): void {
   setText(controls.playPause, label.text);
   setAttribute(controls.playPause, "aria-label", label.aria);
 
+  if (hasVideo && !playing) startPauseTicker();
+  else stopPauseTicker();
+
   // Speed can only be changed once there is a <video> to apply it to.
   setDisplay(controls.speedGroup, hasVideo ? "inline-flex" : "none");
   setText(controls.rate, formatRate(rate));
@@ -498,6 +522,7 @@ function render(): void {
   setDisabled(controls.faster, rate >= RATE_MAX);
 
   renderEta();
+  renderBuffer();
 }
 
 /** While a live stream is paused, the label shows how long the paused position stays available. */
@@ -556,9 +581,51 @@ function renderEta(): void {
 
 // --- Wiring -----------------------------------------------------------------
 
+// --- Buffer label -------------------------------------------------------------
+
+/** Seconds of media buffered ahead of the playhead. */
+function bufferedAhead(v: HTMLVideoElement): number {
+  const ranges = v.buffered;
+  for (let i = 0; i < ranges.length; i++) {
+    if (ranges.start(i) <= v.currentTime + 0.5 && ranges.end(i) >= v.currentTime) return ranges.end(i) - v.currentTime;
+  }
+  return 0;
+}
+
+function readBufferStatus(): BufferStatus | null {
+  const raw = document.documentElement.dataset[BUFFER_STATUS_DATASET_KEY];
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as BufferStatus;
+  } catch {
+    return null;
+  }
+}
+
+function renderBuffer(): void {
+  if (!controls) return;
+  if (!video) {
+    setDisplay(controls.buffer, "none");
+    return;
+  }
+
+  setText(controls.buffer, `buffer ${Math.round(bufferedAhead(video))} s`);
+
+  const status = readBufferStatus();
+  const player = status?.version ? ` (player ${status.version})` : "";
+  const title = !status
+    ? "Seconds buffered ahead of the playhead."
+    : status.active
+      ? `Seconds buffered ahead of the playhead. The extension asks the player for ${status.wanted} s: ${status.how}${player}.`
+      : `Seconds buffered ahead of the playhead. The extension could not raise the player's buffer to ${status.wanted} s: ${status.how}${player}.`;
+  setAttribute(controls.buffer, "title", title);
+  setDisplay(controls.buffer, "inline-flex");
+}
+
 function onTick(): void {
   if (video) updateLiveWindow(video);
   renderEta();
+  renderBuffer();
 }
 
 // Listeners for the live time-shift logic; registered before the render

@@ -23,7 +23,9 @@ rmSync(outdir, { recursive: true, force: true });
 mkdirSync(outdir, { recursive: true });
 
 const ctx = await esbuild.context({
-  entryPoints: ["src/content.ts"],
+  // content.ts runs in the isolated content-script world, page.ts in the
+  // page's own world (see src/manifest.json).
+  entryPoints: ["src/content.ts", "src/page.ts"],
   outdir,
   bundle: true,
   // Content scripts must be plain scripts (no ES modules), so wrap in an IIFE.

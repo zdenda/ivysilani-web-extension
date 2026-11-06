@@ -35,6 +35,13 @@ Current features – a floating control bar in the bottom-left corner of the pag
   to the browser console (prefix `[ivysilani-web-extension]`) so that a bad resume can
   be diagnosed.
 
+- **Bigger buffer**: the player buffers only 10 s ahead by default, so a short Wi-Fi outage
+  stalls playback. The extension asks it to buffer 120 s ahead instead (like YouTube). The
+  bar shows `buffer 118 s` – the seconds actually buffered ahead of the playhead – and its
+  tooltip says whether the setting is active and how the player was reached. Note that the
+  buffer can only hold what already exists: at the live edge there is nothing ahead to
+  fetch, so this helps time-shifted and on-demand playback, not watching live at the edge.
+
 The bar is hidden on pages without a player.
 
 Stack: TypeScript, [`webextension-polyfill`](https://github.com/mozilla/webextension-polyfill),
@@ -49,7 +56,8 @@ ivysilani-web-extension/
 ├── tsconfig.json
 ├── src/
 │   ├── manifest.json    # extension manifest (copied to dist/ as-is)
-│   └── content.ts       # content script that injects the control bar
+│   ├── content.ts       # content script (isolated world): the control bar
+│   └── page.ts          # content script (page world): raises the player's buffer
 └── dist/                # build output – this is what you load into the browser
 ```
 
@@ -133,7 +141,22 @@ harmless warning about it on the extensions page.
   you navigate (on video-on-demand pages it is only created after the poster's
   "Přehrát video" button is clicked). A `MutationObserver` watches the DOM and
   re-attaches the controls to whichever player is currently on the page.
-- esbuild bundles the script and the polyfill into a single `dist/content.js` in IIFE
+- `src/page.ts` is a second content script declared with `"world": "MAIN"`, so it runs in
+  the page's own JavaScript world (Chrome, and Firefox since 128) where the player library
+  lives. It locates the player class without depending on one page build: first a global
+  `shaka` object, then the webpack chunk registry (`self.webpackChunk*`, used by
+  www.ceskatelevize.cz), then the Turbopack chunk registry (`self.TURBOPACK`, used by
+  ct24.ceskatelevize.cz). Both registries accept a probe chunk that hands the script the
+  bundler's require function and module tables, from which it recognises the player module
+  by its source. It
+  then hooks the class: every instance gets `streaming.bufferingGoal = 120` on each
+  `load()`, the setting is re-asserted if the page's own `configure()` call touches it,
+  and instances that existed before the hooks are found through the page's debugging
+  helpers (`window.shakaUtils`) or React's fiber tree. The outcome is written to a data
+  attribute on `<html>` (read by the bar's buffer label) and logged with the prefix
+  `[ivysilani-web-extension/page]`. If none of this finds a player, the bar's tooltip says
+  so instead of anything breaking.
+- esbuild bundles each script (and, for `content.ts`, the polyfill) into `dist/` in IIFE
   format (content scripts can't be ES modules) and copies the manifest next to it.
 
 ## Next steps

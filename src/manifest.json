@@ -11,6 +11,15 @@
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.ceskatelevize.cz/*",
+        "https://ct24.ceskatelevize.cz/*"
+      ],
+      "js": ["page.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "host_permissions": [

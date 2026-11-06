@@ -16,6 +16,11 @@ Current features – a floating control bar in the bottom-left corner of the pag
   clicking the speed label resets it to 1×. The chosen speed survives the player's own
   resets (e.g. the switch from the pre-roll ad to the programme) and navigation between
   episodes.
+- **Time to the end / live edge** label: while playing, the bar shows when playback reaches
+  the end of the programme at the current speed (`ends 21:47 · 23 min`), or – on a live
+  stream above 1× – when it catches up with the live edge (`live in 1:04`). Hovering the
+  label spells it out. The estimate ignores ads, and once a live stream reaches the edge
+  the player has to wait for the broadcast, so expect it to stall there.
 
 The bar is hidden on pages without a player.
 
@@ -92,6 +97,11 @@ harmless warning about it on the extensions page.
   `<video>` element (pre-roll ad → programme). The script remembers the speed you chose
   and re-applies it on `loadedmetadata` / `playing`, and whenever it attaches to a new
   `<video>` element. At 1× it leaves the player alone.
+- The ETA label is computed from the `<video>` element alone and refreshed on every
+  `timeupdate`. Video on demand: `(duration − currentTime) / playbackRate`. Live streams
+  report `duration === Infinity`; their live edge is the end of `video.seekable`, the
+  player normally sits about a minute behind it, and every second of playback at rate
+  `r` closes that gap by `r − 1` seconds, so the countdown is `gap / (r − 1)`.
 - Both sites are single-page apps and the `<video>` element appears and disappears as
   you navigate (on video-on-demand pages it is only created after the poster's
   "Přehrát video" button is clicked). A `MutationObserver` watches the DOM and

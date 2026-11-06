@@ -1,10 +1,11 @@
 // Content script for www.ceskatelevize.cz and ct24.ceskatelevize.cz.
 //
 // Adds a floating control bar to the bottom-left corner of the page with a
-// Play/Pause button and playback-speed controls for the iVysílání player. The
-// player renders an ordinary <video> element straight into the page (no
-// iframe, no shadow DOM), so the controls drive it through the
-// HTMLMediaElement API.
+// Play/Pause button, playback-speed controls and a label estimating when
+// playback reaches the end of the programme (or the live edge of a live
+// stream) at the current speed. The iVysílání player renders an ordinary
+// <video> element straight into the page (no iframe, no shadow DOM), so the
+// controls drive it through the HTMLMediaElement API.
 //
 // Both sites are single-page apps, and on video-on-demand pages the <video>
 // element only appears once the poster's play button has been clicked. The
@@ -36,6 +37,9 @@ const VIDEO_STATE_EVENTS = ["play", "playing", "pause", "ended", "emptied", "rat
  */
 const VIDEO_RATE_RESET_EVENTS = ["loadedmetadata", "playing"] as const;
 
+/** Events that only move the ETA label; they fire several times a second while playing. */
+const VIDEO_TICK_EVENTS = ["timeupdate", "durationchange"] as const;
+
 const LABELS = {
   play: { text: "▶ Play", aria: "Play video" },
   pause: { text: "⏸ Pause", aria: "Pause video" },
@@ -56,6 +60,12 @@ const BUTTON_STYLE = `
   cursor: pointer !important;
 `;
 
+/** Same pill as the buttons, but it is only read, not clicked. */
+const LABEL_STYLE = `${BUTTON_STYLE}
+  cursor: default !important;
+  white-space: nowrap !important;
+`;
+
 interface Controls {
   bar: HTMLDivElement;
   playPause: HTMLButtonElement;
@@ -63,6 +73,7 @@ interface Controls {
   slower: HTMLButtonElement;
   rate: HTMLButtonElement;
   faster: HTMLButtonElement;
+  eta: HTMLSpanElement;
 }
 
 let video: HTMLVideoElement | null = null;
@@ -143,6 +154,64 @@ function setRate(rate: number): void {
   render();
 }
 
+// --- Time to the end / live edge --------------------------------------------
+
+interface Eta {
+  /** "end" of a video-on-demand programme, or the live "edge" of a live stream. */
+  kind: "end" | "edge";
+  /** Wall-clock seconds until playback gets there at the current speed. */
+  seconds: number;
+}
+
+/** Live streams report an infinite duration; their live edge is the end of the seekable range. */
+function liveEdge(v: HTMLVideoElement): number | null {
+  const ranges = v.seekable.length;
+  return ranges > 0 ? v.seekable.end(ranges - 1) : null;
+}
+
+/**
+ * When playback reaches the end of the programme or the live edge at the
+ * current speed, or null when it never will (paused, 1× on a live stream, ...).
+ */
+function computeEta(v: HTMLVideoElement): Eta | null {
+  const rate = v.playbackRate;
+  if (v.paused || v.ended || rate <= 0) return null;
+
+  if (v.duration === Infinity) {
+    // Live: every second of playback closes the gap to the edge by (rate − 1) s.
+    const edge = liveEdge(v);
+    if (edge === null || rate <= 1) return null;
+    return { kind: "edge", seconds: Math.max(0, (edge - v.currentTime) / (rate - 1)) };
+  }
+
+  if (!Number.isFinite(v.duration)) return null;
+  return { kind: "end", seconds: Math.max(0, (v.duration - v.currentTime) / rate) };
+}
+
+/** 21:47 in the viewer's locale. */
+function formatClock(date: Date): string {
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** Rounded to minutes: "1 h 23 min", "23 min", "< 1 min". */
+function formatMinutes(seconds: number): string {
+  const minutes = Math.round(seconds / 60);
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h > 0) return `${h} h ${m} min`;
+  return m > 0 ? `${m} min` : "< 1 min";
+}
+
+/** Ticking countdown: "1:04", "1:02:03". */
+function formatCountdown(seconds: number): string {
+  const total = Math.ceil(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 // --- UI ---------------------------------------------------------------------
 
 function createButton(text: string, title: string, onClick: () => void): HTMLButtonElement {
@@ -190,8 +259,12 @@ function createControls(): Controls {
   const faster = createButton("+", `Faster (+${RATE_STEP}×)`, () => setRate(currentRate() + RATE_STEP));
   speedGroup.append(slower, rate, faster);
 
-  bar.append(playPause, speedGroup);
-  return { bar, playPause, speedGroup, slower, rate, faster };
+  const eta = document.createElement("span");
+  eta.style.cssText = LABEL_STYLE;
+  setDisplay(eta, "none");
+
+  bar.append(playPause, speedGroup, eta);
+  return { bar, playPause, speedGroup, slower, rate, faster, eta };
 }
 
 // Only touch the DOM when something changed, so our own updates don't
@@ -234,6 +307,33 @@ function render(): void {
   setText(controls.rate, formatRate(rate));
   setDisabled(controls.slower, rate <= RATE_MIN);
   setDisabled(controls.faster, rate >= RATE_MAX);
+
+  renderEta();
+}
+
+/** Updates the ETA label; cheap enough to run on every timeupdate. */
+function renderEta(): void {
+  if (!controls) return;
+
+  const eta = video ? computeEta(video) : null;
+  if (!video || !eta) {
+    setDisplay(controls.eta, "none");
+    return;
+  }
+
+  const at = formatClock(new Date(Date.now() + eta.seconds * 1000));
+  const rate = formatRate(video.playbackRate);
+
+  if (eta.kind === "edge") {
+    const countdown = formatCountdown(eta.seconds);
+    setText(controls.eta, `live in ${countdown}`);
+    setAttribute(controls.eta, "title", `At ${rate} you reach the live edge at ${at}, in ${countdown}.`);
+  } else {
+    const minutes = formatMinutes(eta.seconds);
+    setText(controls.eta, `ends ${at} · ${minutes}`);
+    setAttribute(controls.eta, "title", `At ${rate} the programme ends at ${at}, in ${minutes}.`);
+  }
+  setDisplay(controls.eta, "inline-flex");
 }
 
 // --- Wiring -----------------------------------------------------------------
@@ -244,6 +344,7 @@ function attachVideo(next: HTMLVideoElement | null): void {
   if (video) {
     for (const event of VIDEO_STATE_EVENTS) video.removeEventListener(event, render);
     for (const event of VIDEO_RATE_RESET_EVENTS) video.removeEventListener(event, reapplyDesiredRate);
+    for (const event of VIDEO_TICK_EVENTS) video.removeEventListener(event, renderEta);
   }
 
   video = next;
@@ -251,6 +352,7 @@ function attachVideo(next: HTMLVideoElement | null): void {
   if (video) {
     for (const event of VIDEO_STATE_EVENTS) video.addEventListener(event, render);
     for (const event of VIDEO_RATE_RESET_EVENTS) video.addEventListener(event, reapplyDesiredRate);
+    for (const event of VIDEO_TICK_EVENTS) video.addEventListener(event, renderEta);
     reapplyDesiredRate();
   }
 }

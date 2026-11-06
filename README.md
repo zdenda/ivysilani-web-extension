@@ -42,6 +42,10 @@ Current features – a floating control bar in the bottom-left corner of the pag
   buffer can only hold what already exists: at the live edge there is nothing ahead to
   fetch, so this helps time-shifted and on-demand playback, not watching live at the edge.
 
+- **Frame stepping**: the `,` and `.` keys move one frame back / forward, as on YouTube.
+  If the video is playing it is paused first. The frame rate is measured from the frames
+  the browser decodes (25 fps is assumed until a couple of seconds have played).
+
 The bar is hidden on pages without a player.
 
 Stack: TypeScript, [`webextension-polyfill`](https://github.com/mozilla/webextension-polyfill),
@@ -130,6 +134,13 @@ harmless warning about it on the extensions page.
   derived from the live edge (`seekable.end − window`) instead. The pause budget is
   `pausedPosition − 5 s − windowStart` (5 s is shaka's `safeSeekOffset`, where it lands
   when the playhead is outside the window).
+- Frame stepping measures the frame rate from the decoded-frame counter
+  (`getVideoPlaybackQuality().totalVideoFrames`) over two seconds of playback, snapped to a
+  common rate; it counts every frame however rarely a throttled tab paints. Frames sit on a
+  regular grid, so any media time reported by `requestVideoFrameCallback` – even a stale one –
+  fixes the grid's phase, and a step seeks to the middle of the neighbouring frame on that
+  grid, which cannot land on a boundary. Key presses in text fields or with modifiers are
+  ignored.
 - The resume guard is armed on the `play` event after a pause and checks every `playing`
   and `seeked` event for the next 10 s, because the player settles in steps (seek to the
   remembered position, then clamp to the window, sometimes a stream reload). The expected

@@ -6,9 +6,10 @@
 // stream) at the current speed. On live streams it also shows, while paused,
 // how long the paused position stays inside the time-shift window, and it
 // guards the resume: if the player jumps ahead of the paused position, it is
-// seeked back. The iVysílání player renders an ordinary <video> element
-// straight into the page (no iframe, no shadow DOM), so the controls drive it
-// through the HTMLMediaElement API.
+// seeked back. The , and . keys step one frame back / forward, as on
+// YouTube. The iVysílání player renders an ordinary <video> element straight
+// into the page (no iframe, no shadow DOM), so the controls drive it through
+// the HTMLMediaElement API.
 //
 // Both sites are single-page apps, and on video-on-demand pages the <video>
 // element only appears once the poster's play button has been clicked. The
@@ -62,6 +63,19 @@ const RESUME_GUARD_MS = 10_000;
 const PLAYER_SELECTOR = ".playerPageWrapper";
 
 const LOG_PREFIX = "[ivysilani-web-extension]";
+
+/** Frame stepping keys, as on YouTube. */
+const FRAME_BACK_KEY = ",";
+const FRAME_FORWARD_KEY = ".";
+
+/** Used until the real frame rate has been measured (European TV is 25 or 50 fps). */
+const DEFAULT_FRAME_RATE = 25;
+
+/** Playback needed for one frame-rate measurement, in media seconds. */
+const FRAME_RATE_WINDOW = 2;
+
+/** A measurement within 3 % of one of these is snapped to it. */
+const COMMON_FRAME_RATES = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
 
 const LABELS = {
   play: { text: "▶ Play", aria: "Play video" },
@@ -137,6 +151,14 @@ let userWentLive = false;
  */
 let pauseTicker: number | null = null;
 
+/** Media time of the last frame requestVideoFrameCallback reported; any sample fixes the frame grid's phase. */
+let lastFrameMediaTime: number | null = null;
+let frameCallbackHandle: number | null = null;
+/** Frames per second measured from the decoded-frame counter, once enough playback has been seen. */
+let measuredFrameRate: number | null = null;
+/** Start of the current measurement window: decoded frames and media time. */
+let frameRateWindow: { frames: number; time: number } | null = null;
+
 function area(el: Element): number {
   return el.clientWidth * el.clientHeight;
 }
@@ -207,6 +229,85 @@ function setRate(rate: number): void {
   desiredRate = clampRate(rate);
   applyDesiredRate();
   render();
+}
+
+// --- Frame stepping -----------------------------------------------------------
+//
+// The frame rate comes from the decoded-frame counter
+// (getVideoPlaybackQuality().totalVideoFrames) over a stretch of playback:
+// it counts every frame, however rarely a throttled tab paints. Frames sit on
+// a regular grid, and any media time reported by requestVideoFrameCallback,
+// even a stale one, fixes the grid's phase; a step then seeks to the middle
+// of the neighbouring frame on that grid, which cannot land on a boundary.
+
+/** timeupdate while playing: one frame-rate measurement per FRAME_RATE_WINDOW seconds of playback. */
+function sampleFrameRate(v: HTMLVideoElement): void {
+  if (v.paused || typeof v.getVideoPlaybackQuality !== "function") return;
+  const now = { frames: v.getVideoPlaybackQuality().totalVideoFrames, time: v.currentTime };
+  if (!frameRateWindow) {
+    frameRateWindow = now;
+    return;
+  }
+
+  const seconds = now.time - frameRateWindow.time;
+  const frames = now.frames - frameRateWindow.frames;
+  if (seconds < 0 || frames < 0) {
+    frameRateWindow = now;
+    return;
+  }
+  if (seconds < FRAME_RATE_WINDOW) return;
+
+  const raw = frames / seconds;
+  measuredFrameRate = COMMON_FRAME_RATES.find((rate) => Math.abs(rate - raw) / rate < 0.03) ?? raw;
+  frameRateWindow = now;
+}
+
+/** A seek decodes extra frames from the previous keyframe, which must not count. */
+function resetFrameRateWindow(): void {
+  frameRateWindow = null;
+}
+
+function onVideoFrame(_now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata): void {
+  frameCallbackHandle = null;
+  if (!video) return;
+  lastFrameMediaTime = metadata.mediaTime;
+  frameCallbackHandle = video.requestVideoFrameCallback(onVideoFrame);
+}
+
+function startFrameTracking(v: HTMLVideoElement): void {
+  if (typeof v.requestVideoFrameCallback !== "function") return;
+  frameCallbackHandle = v.requestVideoFrameCallback(onVideoFrame);
+}
+
+function stopFrameTracking(v: HTMLVideoElement): void {
+  if (frameCallbackHandle !== null && typeof v.cancelVideoFrameCallback === "function") v.cancelVideoFrameCallback(frameCallbackHandle);
+  frameCallbackHandle = null;
+  lastFrameMediaTime = null;
+  measuredFrameRate = null;
+  frameRateWindow = null;
+}
+
+/** The measured frame duration, or the default until enough playback has been seen. */
+function frameDuration(): number {
+  return 1 / (measuredFrameRate ?? DEFAULT_FRAME_RATE);
+}
+
+/** Moves one frame back or forward; pauses first if the video is playing. */
+function stepFrame(direction: -1 | 1): void {
+  if (!video) return;
+  if (!video.paused) video.pause();
+
+  const duration = frameDuration();
+  const phase = lastFrameMediaTime === null ? 0 : lastFrameMediaTime % duration;
+  // Frame k spans [phase + k·d, phase + (k+1)·d); aim for the middle of frame k ± 1.
+  const current = Math.floor((video.currentTime - phase) / duration + 1e-6);
+  video.currentTime = Math.max(0, phase + (current + direction + 0.5) * duration);
+}
+
+/** Should a key press be left to the page: typing in a field, or a shortcut with modifiers. */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName);
 }
 
 // --- Time to the end / live edge --------------------------------------------
@@ -413,9 +514,19 @@ function onDocumentClick(event: Event): void {
   }
 }
 
-/** A key press after a resume (arrow keys seek in the player) disarms the guard too. */
-function onDocumentKeydown(): void {
+/**
+ * , and . step one frame back / forward. Any key press after a resume (arrow
+ * keys seek in the player) disarms the resume guard too.
+ */
+function onDocumentKeydown(event: KeyboardEvent): void {
   resumeGuard = null;
+
+  if (!video || event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) return;
+  if (event.key !== FRAME_BACK_KEY && event.key !== FRAME_FORWARD_KEY) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  stepFrame(event.key === FRAME_FORWARD_KEY ? 1 : -1);
 }
 
 // --- UI ---------------------------------------------------------------------
@@ -435,7 +546,7 @@ function createControls(): Controls {
 
   const bar = document.createElement("div");
   bar.id = BAR_ID;
-  bar.title = `${name} v${version}`;
+  bar.title = `${name} v${version} – keys: ${FRAME_BACK_KEY} / ${FRAME_FORWARD_KEY} step one frame back / forward`;
   bar.style.cssText = `
     position: fixed !important;
     left: 16px !important;
@@ -623,7 +734,10 @@ function renderBuffer(): void {
 }
 
 function onTick(): void {
-  if (video) updateLiveWindow(video);
+  if (video) {
+    updateLiveWindow(video);
+    sampleFrameRate(video);
+  }
   renderEta();
   renderBuffer();
 }
@@ -648,7 +762,9 @@ function attachVideo(next: HTMLVideoElement | null): void {
     for (const event of VIDEO_STATE_EVENTS) video.removeEventListener(event, render);
     for (const event of VIDEO_RATE_RESET_EVENTS) video.removeEventListener(event, reapplyDesiredRate);
     for (const event of VIDEO_TICK_EVENTS) video.removeEventListener(event, onTick);
+    video.removeEventListener("seeking", resetFrameRateWindow);
     stopPauseTicker();
+    stopFrameTracking(video);
   }
 
   // A new <video> element keeps a pending resume (the app may swap elements
@@ -661,7 +777,9 @@ function attachVideo(next: HTMLVideoElement | null): void {
     for (const event of VIDEO_STATE_EVENTS) video.addEventListener(event, render);
     for (const event of VIDEO_RATE_RESET_EVENTS) video.addEventListener(event, reapplyDesiredRate);
     for (const event of VIDEO_TICK_EVENTS) video.addEventListener(event, onTick);
+    video.addEventListener("seeking", resetFrameRateWindow);
     reapplyDesiredRate();
+    startFrameTracking(video);
   }
 }
 

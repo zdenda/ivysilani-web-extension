@@ -1,8 +1,8 @@
 {
-  "name": "hello-world-extension",
+  "name": "ivysilani-web-extension",
   "version": "0.1.0",
   "private": true,
-  "description": "Browser extension that shows a \"Hello World\" badge in the bottom-left corner of every page.",
+  "description": "Browser extension that improves the iVysílání video player on ceskatelevize.cz.",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",

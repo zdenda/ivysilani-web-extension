@@ -22,6 +22,19 @@ Current features – a floating control bar in the bottom-left corner of the pag
   label spells it out. The estimate ignores ads, and once a live stream reaches the edge
   the player has to wait for the broadcast, so expect it to stall there.
 
+- **Pause budget on live streams**: ČT live streams can be rewound only within a sliding
+  window (about 76 s on the plain live stream, 3 h once you have rewound). While paused,
+  the bar counts down how long your paused position stays inside that window
+  (`resume within 1:23:45`), then shows `position expired`.
+- **Resume guard on live streams**: the player remembers where you paused and seeks back
+  there on resume, but if that position has left the window it clamps to the oldest
+  available point, and sometimes it ends up at live. If the player lands well ahead of
+  the paused position although an older one is still available, the extension seeks
+  back to the paused position (or to the oldest available point). Resuming through the
+  player's own "ŽIVĚ" button is left alone. Every pause/resume on a live stream is logged
+  to the browser console (prefix `[ivysilani-web-extension]`) so that a bad resume can
+  be diagnosed.
+
 The bar is hidden on pages without a player.
 
 Stack: TypeScript, [`webextension-polyfill`](https://github.com/mozilla/webextension-polyfill),
@@ -102,6 +115,20 @@ harmless warning about it on the extensions page.
   report `duration === Infinity`; their live edge is the end of `video.seekable`, the
   player normally sits about a minute behind it, and every second of playback at rate
   `r` closes that gap by `r − 1` seconds, so the countdown is `gap / (r − 1)`.
+- The time-shift window length is measured while playing as
+  `seekable.end − seekable.start`. `seekable.start` is the lower of shaka-player's window
+  start and the start of the back-buffer, so it is only trusted when the buffer starts
+  later; during a pause it is frozen by the back-buffer, which is why the window start is
+  derived from the live edge (`seekable.end − window`) instead. The pause budget is
+  `pausedPosition − 5 s − windowStart` (5 s is shaka's `safeSeekOffset`, where it lands
+  when the playhead is outside the window).
+- The resume guard is armed on the `play` event after a pause and checks every `playing`
+  and `seeked` event for the next 10 s, because the player settles in steps (seek to the
+  remembered position, then clamp to the window, sometimes a stream reload). The expected
+  position is `max(pausedPosition, windowStart + 5 s)`; if the playhead is more than 10 s
+  past it, the script seeks back once. A click on the player's "ŽIVĚ" button while paused
+  is honoured, and any other click in the player or key press after the resume disarms the
+  guard so it never undoes a deliberate seek.
 - Both sites are single-page apps and the `<video>` element appears and disappears as
   you navigate (on video-on-demand pages it is only created after the poster's
   "Přehrát video" button is clicked). A `MutationObserver` watches the DOM and

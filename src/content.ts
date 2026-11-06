@@ -3,9 +3,12 @@
 // Adds a floating control bar to the bottom-left corner of the page with a
 // Play/Pause button, playback-speed controls and a label estimating when
 // playback reaches the end of the programme (or the live edge of a live
-// stream) at the current speed. The iVysílání player renders an ordinary
-// <video> element straight into the page (no iframe, no shadow DOM), so the
-// controls drive it through the HTMLMediaElement API.
+// stream) at the current speed. On live streams it also shows, while paused,
+// how long the paused position stays inside the time-shift window, and it
+// guards the resume: if the player jumps ahead of the paused position, it is
+// seeked back. The iVysílání player renders an ordinary <video> element
+// straight into the page (no iframe, no shadow DOM), so the controls drive it
+// through the HTMLMediaElement API.
 //
 // Both sites are single-page apps, and on video-on-demand pages the <video>
 // element only appears once the poster's play button has been clicked. The
@@ -39,6 +42,26 @@ const VIDEO_RATE_RESET_EVENTS = ["loadedmetadata", "playing"] as const;
 
 /** Events that only move the ETA label; they fire several times a second while playing. */
 const VIDEO_TICK_EVENTS = ["timeupdate", "durationchange"] as const;
+
+/** The player's own "go to live" button; a resume through it must not be "corrected". */
+const LIVE_BUTTON_SELECTOR = 'button[title="Přejít na živé vysílání"]';
+
+/**
+ * Where shaka-player puts the playhead when it is outside the seekable window
+ * (its safeSeekOffset): just inside the window start.
+ */
+const LIVE_SAFE_OFFSET = 5;
+
+/** A resume that lands this many seconds ahead of the expected position counts as a jump. */
+const RESUME_JUMP_TOLERANCE = 10;
+
+/** How long after a resume the guard keeps watching for a late jump. */
+const RESUME_GUARD_MS = 10_000;
+
+/** The player's own UI; a click in it after a resume means the user took over. */
+const PLAYER_SELECTOR = ".playerPageWrapper";
+
+const LOG_PREFIX = "[ivysilani-web-extension]";
 
 const LABELS = {
   play: { text: "▶ Play", aria: "Play video" },
@@ -81,6 +104,22 @@ let controls: Controls | null = null;
 
 /** The speed the user asked for; re-applied whenever the player resets it. */
 let desiredRate = RATE_DEFAULT;
+
+/** Length of the live stream's time-shift window in seconds, measured while playing. */
+let liveWindow: number | null = null;
+
+/** Where the user paused a live stream, while it is paused. */
+let pausedAt: number | null = null;
+let pausedWall = 0;
+
+/** Armed on resume: the position to get back to, until when to watch for a jump, and whether the verdict was logged. */
+let resumeGuard: { remembered: number; until: number; reported: boolean } | null = null;
+
+/** Set when the user clicks the player's "live" button while paused. */
+let userWentLive = false;
+
+/** Ticks the pause-budget countdown while a live stream is paused. */
+let pauseTicker: number | null = null;
 
 function area(el: Element): number {
   return el.clientWidth * el.clientHeight;
@@ -163,7 +202,12 @@ interface Eta {
   seconds: number;
 }
 
-/** Live streams report an infinite duration; their live edge is the end of the seekable range. */
+/** Live streams report an infinite duration. */
+function isLive(v: HTMLVideoElement): boolean {
+  return v.duration === Infinity;
+}
+
+/** The live edge is the end of the seekable range. */
 function liveEdge(v: HTMLVideoElement): number | null {
   const ranges = v.seekable.length;
   return ranges > 0 ? v.seekable.end(ranges - 1) : null;
@@ -193,12 +237,12 @@ function formatClock(date: Date): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-/** Rounded to minutes: "1 h 23 min", "23 min", "< 1 min". */
+/** Rounded to minutes: "1 h 23 min", "3 h", "23 min", "< 1 min". */
 function formatMinutes(seconds: number): string {
   const minutes = Math.round(seconds / 60);
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
-  if (h > 0) return `${h} h ${m} min`;
+  if (h > 0) return m > 0 ? `${h} h ${m} min` : `${h} h`;
   return m > 0 ? `${m} min` : "< 1 min";
 }
 
@@ -210,6 +254,151 @@ function formatCountdown(seconds: number): string {
   const s = total % 60;
   const pad = (n: number): string => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+// --- Live time-shift window: pause budget and resume guard -------------------
+//
+// ČT live streams come in two flavours: the plain live stream keeps only
+// ~76 s of time-shift, the time-shift stream (used as soon as you rewind)
+// keeps 3 h. Both windows slide forward in real time. The player remembers
+// the position where you paused and seeks back to it on resume, but if that
+// position has meanwhile left the window, shaka-player clamps the playhead to
+// the oldest available point, and the stream appears to "skip forward".
+
+/**
+ * Measures the window length while playing. `video.seekable.start` is the
+ * lower of shaka's window start and the start of the back-buffer, so it is
+ * only trusted when the buffer starts later than it; the measurement is
+ * replaced outright when it changes by more than the back-buffer can explain
+ * (the player switched between the two stream flavours).
+ */
+function updateLiveWindow(v: HTMLVideoElement): void {
+  if (!isLive(v) || v.paused || v.seekable.length === 0) return;
+
+  const start = v.seekable.start(0);
+  const raw = v.seekable.end(v.seekable.length - 1) - start;
+  const unmasked = v.buffered.length > 0 && v.buffered.start(0) > start + 1;
+  if (unmasked || liveWindow === null || Math.abs(raw - liveWindow) > 60) liveWindow = raw;
+}
+
+/**
+ * The oldest position still inside the window. Derived from the live edge,
+ * which keeps moving while paused, unlike `seekable.start`, which is frozen
+ * by the back-buffer during a pause.
+ */
+function liveWindowStart(v: HTMLVideoElement): number | null {
+  const edge = liveEdge(v);
+  return liveWindow === null || edge === null ? null : edge - liveWindow;
+}
+
+/** Seconds until the paused position leaves the window; negative once it has. */
+function pauseBudget(v: HTMLVideoElement): number | null {
+  const start = liveWindowStart(v);
+  return pausedAt === null || start === null ? null : pausedAt - LIVE_SAFE_OFFSET - start;
+}
+
+function startPauseTicker(): void {
+  stopPauseTicker();
+  pauseTicker = window.setInterval(renderEta, 1000);
+}
+
+function stopPauseTicker(): void {
+  if (pauseTicker === null) return;
+  clearInterval(pauseTicker);
+  pauseTicker = null;
+}
+
+function describe(v: HTMLVideoElement): string {
+  const start = liveWindowStart(v)?.toFixed(1) ?? "?";
+  const edge = liveEdge(v)?.toFixed(1) ?? "?";
+  return `position ${v.currentTime.toFixed(1)} s, window ${start} – ${edge} s`;
+}
+
+/** 'pause': remember where the user stopped and start the countdown. */
+function onLivePause(): void {
+  if (!video || !isLive(video)) return;
+  pausedAt = video.currentTime;
+  pausedWall = Date.now();
+  resumeGuard = null;
+  userWentLive = false;
+  console.info(`${LOG_PREFIX} paused live stream: ${describe(video)}`);
+  startPauseTicker();
+}
+
+/** 'seeking' while paused: the user moved the slider, so that is the new remembered position. */
+function onLiveSeeking(): void {
+  if (!video || pausedAt === null || !video.paused) return;
+  pausedAt = video.currentTime;
+}
+
+/** 'play': arm the guard with the remembered position and log what the resume starts from. */
+function onLivePlay(): void {
+  stopPauseTicker();
+  if (!video || pausedAt === null || !isLive(video)) return;
+  const elapsed = Math.round((Date.now() - pausedWall) / 1000);
+  console.info(`${LOG_PREFIX} resuming after ${elapsed} s: remembered ${pausedAt.toFixed(1)} s, ${describe(video)}`);
+  resumeGuard = { remembered: pausedAt, until: Date.now() + RESUME_GUARD_MS, reported: false };
+  pausedAt = null;
+}
+
+/** 'emptied' / 'loadstart' while paused or resuming: the player reloaded the stream. */
+function onLiveReload(event: Event): void {
+  const remembered = pausedAt ?? resumeGuard?.remembered;
+  if (remembered === undefined || remembered === null) return;
+  console.info(`${LOG_PREFIX} stream reloaded (${event.type}) while resuming from ${remembered.toFixed(1)} s`);
+}
+
+/**
+ * 'playing' / 'seeked' while the guard is armed. The player may settle in
+ * several steps (seek to the remembered position, then clamp to the window),
+ * so this runs on each of them: if the playhead ends up well ahead of the
+ * remembered position although that position (or at least an older one) is
+ * still available, seek back.
+ */
+function checkLiveResume(event: Event): void {
+  if (!video || !resumeGuard || !isLive(video)) return;
+
+  if (Date.now() > resumeGuard.until) {
+    resumeGuard = null;
+    return;
+  }
+  if (userWentLive) {
+    console.info(`${LOG_PREFIX} resumed via the live button, leaving the player alone`);
+    resumeGuard = null;
+    return;
+  }
+
+  const start = liveWindowStart(video);
+  const target = start === null ? resumeGuard.remembered : Math.max(resumeGuard.remembered, start + LIVE_SAFE_OFFSET);
+  const landed = video.currentTime;
+  if (landed <= target + RESUME_JUMP_TOLERANCE) {
+    // The player may fire 'playing' more than once; report the verdict only the first time.
+    if (event.type === "playing" && !resumeGuard.reported) {
+      resumeGuard.reported = true;
+      console.info(`${LOG_PREFIX} resumed at ${landed.toFixed(1)} s (expected ≈ ${target.toFixed(1)} s), fine`);
+    }
+    return;
+  }
+
+  console.warn(`${LOG_PREFIX} resume jumped to ${landed.toFixed(1)} s, expected ≈ ${target.toFixed(1)} s; seeking back`);
+  resumeGuard = null;
+  video.currentTime = target;
+}
+
+/** Clicks on the player's "live" button are honoured; any other click in the player after a resume disarms the guard. */
+function onDocumentClick(event: Event): void {
+  if (pausedAt === null && !resumeGuard) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest(LIVE_BUTTON_SELECTOR)) {
+    userWentLive = true;
+  } else if (resumeGuard && target?.closest(PLAYER_SELECTOR)) {
+    resumeGuard = null;
+  }
+}
+
+/** A key press after a resume (arrow keys seek in the player) disarms the guard too. */
+function onDocumentKeydown(): void {
+  resumeGuard = null;
 }
 
 // --- UI ---------------------------------------------------------------------
@@ -311,9 +500,38 @@ function render(): void {
   renderEta();
 }
 
+/** While a live stream is paused, the label shows how long the paused position stays available. */
+function renderPauseBudget(v: HTMLVideoElement): boolean {
+  if (!controls || !v.paused || !isLive(v)) return false;
+  const budget = pauseBudget(v);
+  if (budget === null || liveWindow === null) return false;
+
+  const window_ = formatMinutes(liveWindow);
+  if (budget > 0) {
+    const countdown = formatCountdown(budget);
+    setText(controls.eta, `resume within ${countdown}`);
+    setAttribute(
+      controls.eta,
+      "title",
+      `The time-shift window keeps ${window_}. Your paused position leaves it at ${formatClock(new Date(Date.now() + budget * 1000))}; after that the player resumes at the oldest available point instead.`,
+    );
+  } else {
+    setText(controls.eta, "position expired");
+    setAttribute(
+      controls.eta,
+      "title",
+      `Your paused position has left the ${window_} time-shift window; the player will resume about ${formatCountdown(-budget)} later than where you paused.`,
+    );
+  }
+  setDisplay(controls.eta, "inline-flex");
+  return true;
+}
+
 /** Updates the ETA label; cheap enough to run on every timeupdate. */
 function renderEta(): void {
   if (!controls) return;
+
+  if (video && renderPauseBudget(video)) return;
 
   const eta = video ? computeEta(video) : null;
   if (!video || !eta) {
@@ -338,21 +556,44 @@ function renderEta(): void {
 
 // --- Wiring -----------------------------------------------------------------
 
+function onTick(): void {
+  if (video) updateLiveWindow(video);
+  renderEta();
+}
+
+// Listeners for the live time-shift logic; registered before the render
+// listeners so that render() sees the updated state.
+const LIVE_LISTENERS: ReadonlyArray<[string, (event: Event) => void]> = [
+  ["pause", onLivePause],
+  ["seeking", onLiveSeeking],
+  ["play", onLivePlay],
+  ["playing", checkLiveResume],
+  ["seeked", checkLiveResume],
+  ["emptied", onLiveReload],
+  ["loadstart", onLiveReload],
+];
+
 function attachVideo(next: HTMLVideoElement | null): void {
   if (next === video) return;
 
   if (video) {
+    for (const [event, listener] of LIVE_LISTENERS) video.removeEventListener(event, listener);
     for (const event of VIDEO_STATE_EVENTS) video.removeEventListener(event, render);
     for (const event of VIDEO_RATE_RESET_EVENTS) video.removeEventListener(event, reapplyDesiredRate);
-    for (const event of VIDEO_TICK_EVENTS) video.removeEventListener(event, renderEta);
+    for (const event of VIDEO_TICK_EVENTS) video.removeEventListener(event, onTick);
+    stopPauseTicker();
   }
 
+  // A new <video> element keeps a pending resume (the app may swap elements
+  // while reloading the stream) but needs its own window measurement.
   video = next;
+  liveWindow = null;
 
   if (video) {
+    for (const [event, listener] of LIVE_LISTENERS) video.addEventListener(event, listener);
     for (const event of VIDEO_STATE_EVENTS) video.addEventListener(event, render);
     for (const event of VIDEO_RATE_RESET_EVENTS) video.addEventListener(event, reapplyDesiredRate);
-    for (const event of VIDEO_TICK_EVENTS) video.addEventListener(event, renderEta);
+    for (const event of VIDEO_TICK_EVENTS) video.addEventListener(event, onTick);
     reapplyDesiredRate();
   }
 }
@@ -387,3 +628,5 @@ new MutationObserver(scheduleSync).observe(document.documentElement, {
   childList: true,
   subtree: true,
 });
+document.addEventListener("click", onDocumentClick, true);
+document.addEventListener("keydown", onDocumentKeydown, true);

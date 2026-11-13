@@ -6,10 +6,12 @@
 // stream) at the current speed. On live streams it also shows, while paused,
 // how long the paused position stays inside the time-shift window, and it
 // guards the resume: if the player jumps ahead of the paused position, it is
-// seeked back. The , and . keys step one frame back / forward, as on
-// YouTube. The iVysílání player renders an ordinary <video> element straight
-// into the page (no iframe, no shadow DOM), so the controls drive it through
-// the HTMLMediaElement API.
+// seeked back. The , and . keys step one frame back / forward, J / L and
+// ← / → seek 10 s / 5 s, as on YouTube; on a live stream a rewind that leaves
+// the short live window switches the player to its time-shift stream first.
+// The iVysílání player renders an ordinary <video> element straight into the
+// page (no iframe, no shadow DOM), so the controls drive it through the
+// HTMLMediaElement API.
 //
 // Both sites are single-page apps, and on video-on-demand pages the <video>
 // element only appears once the poster's play button has been clicked. The
@@ -68,6 +70,65 @@ const LOG_PREFIX = "[ivysilani-web-extension]";
 const FRAME_BACK_KEY = ",";
 const FRAME_FORWARD_KEY = ".";
 
+/** Seek keys, as on YouTube: arrows 5 s, J / L 10 s. */
+const SEEK_SMALL_SECONDS = 5;
+const SEEK_LARGE_SECONDS = 10;
+const SEEK_KEYS: Readonly<Record<string, number>> = {
+  ArrowLeft: -SEEK_SMALL_SECONDS,
+  ArrowRight: SEEK_SMALL_SECONDS,
+  j: -SEEK_LARGE_SECONDS,
+  l: SEEK_LARGE_SECONDS,
+};
+
+/** Never seek closer to the live edge than this; the player has nothing to show there yet. */
+const LIVE_EDGE_MARGIN = 3;
+
+/** What the player's slider spans on a live stream: the 3 h time-shift window. */
+const TIME_SHIFT_SPAN = 10_800;
+
+/**
+ * The slider lands only roughly (a pixel is ~20 s and the player adds its
+ * own offsets), so the switch asks for this much further back than needed
+ * and the exact position is reached with a seek afterwards.
+ */
+const TIME_SHIFT_OVERSHOOT = 120;
+
+/**
+ * The player rounds the slider to whole percent of its 3 h and treats 99 %
+ * as "still live" (it then seeks inside the plain stream and clamps), so a
+ * request must be at least this far back to land at 98 % or less.
+ */
+const TIME_SHIFT_MIN_REQUEST = 250;
+const STREAM_SWITCH_TIMEOUT_MS = 10_000;
+
+/**
+ * After the switch the player itself seeks to where its slider was clicked.
+ * Normally that happens before this script places the playhead, but under
+ * load it can arrive later and undo the placement. For this long after the
+ * placement, a playhead that gets moved elsewhere is put back.
+ */
+const LANDING_GUARD_MS = 8000;
+
+/** How far (in seconds) from where playback could have got to counts as "moved elsewhere". */
+const LANDING_TOLERANCE = 3;
+
+/** The guard gives up after this many corrections rather than fight the player. */
+const LANDING_MAX_CORRECTIONS = 2;
+
+/**
+ * A pause on the plain live stream that lasts longer than this moves the
+ * paused position to the time-shift stream, whose 3 h window keeps it; on
+ * the plain stream it would leave the ~75 s window within a minute.
+ */
+const PAUSE_TO_TIME_SHIFT_MS = 3000;
+
+/** How long after a real click or key press a 'play' or 'pause' counts as the user's doing. */
+const USER_GESTURE_MS = 1000;
+const SLIDER_SELECTOR = `${PLAYER_SELECTOR} [role="slider"]`;
+
+/** How long the player needs to render its controls after a mouse move (React renders on the next frame). */
+const CONTROLS_RENDER_MS = 300;
+
 /** Used until the real frame rate has been measured (European TV is 25 or 50 fps). */
 const DEFAULT_FRAME_RATE = 25;
 
@@ -106,6 +167,7 @@ const LABEL_STYLE = `${BUTTON_STYLE}
 interface Controls {
   bar: HTMLDivElement;
   playPause: HTMLButtonElement;
+  seekGroup: HTMLSpanElement;
   speedGroup: HTMLSpanElement;
   slower: HTMLButtonElement;
   rate: HTMLButtonElement;
@@ -143,6 +205,35 @@ let resumeGuard: { remembered: number; until: number; reported: boolean } | null
 
 /** Set when the user clicks the player's "live" button while paused. */
 let userWentLive = false;
+
+/**
+ * A rewind that is waiting for the player to switch to its time-shift stream.
+ * `wantedPaused` is the play state to end up in: the one the switch started
+ * from, unless the user plays or pauses in the meantime (see noteUserPlayState).
+ */
+let pendingTimeShift: { behindLive: number; wantedPaused: boolean; startedAt: number; from: number } | null = null;
+
+/** When the user last really clicked or pressed a key (scripted events do not count). */
+let lastUserGesture = 0;
+
+/** The page path the live-stream state above belongs to (see dropLiveStateOnNavigation). */
+let livePath = location.pathname;
+
+/**
+ * Armed once the playhead has been placed on the time-shift stream: the last
+ * position known to be ours and when it was seen, until when to watch, and
+ * how often the playhead has been put back.
+ */
+let landingGuard: {
+  video: HTMLVideoElement;
+  position: number;
+  seenAt: number;
+  until: number;
+  corrections: number;
+} | null = null;
+
+/** Scheduled move of a paused position from the plain live stream to the time-shift stream. */
+let pauseSwitchTimer: number | null = null;
 
 /**
  * While the video is paused no timeupdate events arrive, yet the pause-budget
@@ -304,10 +395,288 @@ function stepFrame(direction: -1 | 1): void {
   video.currentTime = Math.max(0, phase + (current + direction + 0.5) * duration);
 }
 
-/** Should a key press be left to the page: typing in a field, or a shortcut with modifiers. */
-function isTypingTarget(target: EventTarget | null): boolean {
+/** Is the key press typing in a field, which must be left to the page? */
+function isTypingTarget(event: Event): boolean {
+  // For a field inside a shadow tree the event's target is the tree's host;
+  // the first entry of the composed path is the element really typed into.
+  const target = event.composedPath()[0] ?? event.target;
   if (!(target instanceof HTMLElement)) return false;
   return target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName);
+}
+
+// --- Seeking by a few seconds -----------------------------------------------
+//
+// Live streams come in two flavours (see the time-shift section below). The
+// player's own skip button and arrow keys seek 10 s on the plain live stream
+// and are silently clamped at its window start, about 67 s behind live; only
+// a click on its slider makes it load the 3 h time-shift stream. So a rewind
+// that would leave the plain window is done by clicking that slider from
+// script, further back than needed, and seeking forward to the exact point
+// once the new stream plays.
+
+function seekBy(seconds: number): void {
+  if (!video) return;
+  const v = video;
+  const from = v.currentTime;
+  landingGuard = null; // a deliberate move, not one to undo
+
+  if (!isLive(v)) {
+    const max = Number.isFinite(v.duration) ? Math.max(0, v.duration - 0.5) : Infinity;
+    v.currentTime = Math.min(max, Math.max(0, from + seconds));
+    return;
+  }
+
+  const edge = estimatedLiveEdge(v);
+  if (edge === null) return;
+  if (seconds >= 0) {
+    v.currentTime = Math.min(from + seconds, (liveEdge(v) ?? edge) - LIVE_EDGE_MARGIN);
+    return;
+  }
+
+  const target = from + seconds;
+  const start = liveWindowStart(v) ?? v.seekable.start(0);
+  // The player clamps anything below start + safeSeekOffset.
+  const floor = start + LIVE_SAFE_OFFSET + 1;
+  if (target >= floor) {
+    v.currentTime = target;
+    return;
+  }
+  void switchToTimeShift(edge - target);
+}
+
+/**
+ * Makes the player render its controls (they are not in the DOM while
+ * hidden) and returns its slider.
+ *
+ * The player shows the controls when the mouse moves over an overlay that
+ * covers the picture. The overlay is a sibling of the <video>, not an
+ * ancestor, so the event has to go to the overlay itself or to something
+ * inside it. Which element that is cannot be read from the player's React
+ * props here: this script runs in the extension's isolated world, where the
+ * properties the page's JavaScript puts on DOM nodes are invisible.
+ * Hit-testing finds it instead: the overlay is whatever lies on top in the
+ * middle of the picture. If that does not work (the player is scrolled out
+ * of view, or something covers it), every leaf element of the player gets
+ * the event; mouse moves bubble, so the overlay is reached through one of
+ * them wherever it sits.
+ */
+async function revealSlider(): Promise<Element | null> {
+  const present = findTimeline();
+  if (present) return present;
+
+  const wrapper = document.querySelector(PLAYER_SELECTOR);
+  if (!wrapper) return null;
+  const frame = (video ?? wrapper).getBoundingClientRect();
+  const at = { clientX: frame.left + frame.width / 2, clientY: frame.top + frame.height / 2 };
+
+  const attempts: Element[][] = [];
+  const onTop = document.elementFromPoint(at.clientX, at.clientY);
+  if (onTop && wrapper.contains(onTop)) attempts.push([onTop]);
+  attempts.push([...wrapper.querySelectorAll("*")].filter((el) => el.childElementCount === 0));
+
+  for (const targets of attempts) {
+    for (const target of targets) {
+      target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, ...at }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, CONTROLS_RENDER_MS));
+    const slider = findTimeline();
+    if (slider) return slider;
+  }
+  return null;
+}
+
+/** The player's timeline. Its volume control is a slider too, so of the sliders it is the widest. */
+function findTimeline(): Element | null {
+  let widest: Element | null = null;
+  for (const slider of document.querySelectorAll(SLIDER_SELECTOR)) {
+    if (!widest || slider.getBoundingClientRect().width > widest.getBoundingClientRect().width) widest = slider;
+  }
+  return widest;
+}
+
+/** The innermost part of `root` that spans the point, or `root` itself. */
+function innermostAt(root: Element, x: number, y: number): Element {
+  let innermost = root;
+  // Descendants follow their ancestors in document order, so the last match is the deepest.
+  for (const el of root.querySelectorAll("*")) {
+    const r = el.getBoundingClientRect();
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) innermost = el;
+  }
+  return innermost;
+}
+
+/** A click on the slider track at the given fraction of its width (0 = oldest, 1 = live). */
+function clickSlider(slider: Element, fraction: number): void {
+  const r = slider.getBoundingClientRect();
+  const x = r.left + r.width * fraction;
+  const y = r.top + r.height / 2;
+  // The events go to the part of the slider under the point, as a real click
+  // would. If something else lies on top there (this extension's own bar
+  // can), that must not get the click, so the slider's part is looked up by
+  // its position instead.
+  const onTop = document.elementFromPoint(x, y);
+  const target = onTop && slider.contains(onTop) ? onTop : innermostAt(slider, x, y);
+  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    const init = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, buttons: type.endsWith("down") ? 1 : 0 };
+    target.dispatchEvent(
+      type.startsWith("pointer")
+        ? new PointerEvent(type, { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true })
+        : new MouseEvent(type, init),
+    );
+  }
+}
+
+async function switchToTimeShift(behindLive: number): Promise<void> {
+  if (!video || pendingTimeShift) return;
+  // Marked as pending before the wait below, so that a second key press in
+  // the meantime cannot start a second switch.
+  const pending = { behindLive, wantedPaused: video.paused, startedAt: Date.now(), from: video.currentTime };
+  pendingTimeShift = pending;
+
+  const slider = await revealSlider();
+  if (pendingTimeShift !== pending) return; // the user left the page meanwhile
+  if (!slider) {
+    pendingTimeShift = null;
+    console.warn(`${LOG_PREFIX} cannot rewind past the live window: the player's slider was not found`);
+    return;
+  }
+
+  const asked = Math.min(Math.max(behindLive + TIME_SHIFT_OVERSHOOT, TIME_SHIFT_MIN_REQUEST), TIME_SHIFT_SPAN - 60);
+  // This is a deliberate move, not a resume to guard.
+  resumeGuard = null;
+  pausedAt = null;
+  console.info(`${LOG_PREFIX} ${behindLive.toFixed(0)} s behind live is outside the live window; switching to the time-shift stream (asking the slider for ${asked.toFixed(0)} s)`);
+  clickSlider(slider, 1 - asked / TIME_SHIFT_SPAN);
+
+  window.setTimeout(() => {
+    if (!pendingTimeShift || Date.now() - pendingTimeShift.startedAt < STREAM_SWITCH_TIMEOUT_MS) return;
+    const { from, wantedPaused: paused } = pendingTimeShift;
+    pendingTimeShift = null;
+    console.warn(`${LOG_PREFIX} the player did not switch to the time-shift stream`);
+    // The click may still have moved the playhead inside the plain stream: put it back as far as the window allows.
+    if (video && onPlainLiveStream(video)) {
+      const floor = (liveWindowStart(video) ?? video.seekable.start(0)) + LIVE_SAFE_OFFSET + 1;
+      const restored = Math.max(from, floor);
+      if (Math.abs(video.currentTime - restored) > 1) video.currentTime = restored;
+      if (paused) {
+        if (!video.paused) video.pause();
+        pausedAt = restored;
+      }
+    }
+  }, STREAM_SWITCH_TIMEOUT_MS);
+}
+
+/**
+ * After the switch the player settles in several steps (it loads the stream
+ * at the start of the window, seeks to the live edge, then to the slider
+ * position, and plays only if it was playing). Each of these events on the
+ * time-shift stream restarts a short timer; when the player has been quiet
+ * for that long, seek to the exact point and restore the paused state. A
+ * step that still arrives later is undone by the landing guard below.
+ */
+let settleTimer: number | null = null;
+const SETTLE_MS = 700;
+
+function onTimeShiftEvent(): void {
+  if (!pendingTimeShift || !video || !isLive(video) || video.seekable.length === 0) return;
+  if (video.seekable.end(0) - video.seekable.start(0) < 1000) return; // still the plain stream
+  if (settleTimer !== null) clearTimeout(settleTimer);
+  settleTimer = window.setTimeout(finishTimeShift, SETTLE_MS);
+}
+
+function finishTimeShift(): void {
+  settleTimer = null;
+  if (!pendingTimeShift || !video || video.seekable.length === 0) return;
+  const v = video;
+  const { wantedPaused, startedAt } = pendingTimeShift;
+  // The requested content moment keeps falling further behind live while the
+  // switch takes its few seconds, so the distance is anchored to wall-clock time.
+  const behindLive = pendingTimeShift.behindLive + (Date.now() - startedAt) / 1000;
+  pendingTimeShift = null;
+
+  const span = v.seekable.end(0) - v.seekable.start(0);
+  liveWindow = span; // the stream changed; a paused player would not measure it otherwise
+  edgeTrack = null; // and so did the timeline
+  const target = (estimatedLiveEdge(v) ?? v.seekable.end(0)) - behindLive;
+  console.info(`${LOG_PREFIX} time-shift stream loaded ${(v.seekable.end(0) - v.currentTime).toFixed(0)} s behind live (${v.paused ? "paused" : "playing"}); seeking to ${behindLive.toFixed(0)} s behind`);
+  if (Math.abs(v.currentTime - target) > 1) v.currentTime = target;
+  landingGuard = { video: v, position: target, seenAt: Date.now(), until: Date.now() + LANDING_GUARD_MS, corrections: 0 };
+  if (wantedPaused) {
+    if (!v.paused) v.pause();
+    // The player may already be paused, so no 'pause' event records the position for the countdown and the resume guard.
+    pausedAt = target;
+    pausedWall = pausedWall || Date.now();
+  } else if (v.paused) {
+    void v.play().catch(() => undefined);
+  }
+}
+
+/** The armed guard for this video, or null; an expired or outdated guard is dropped. */
+function activeLandingGuard(v: HTMLVideoElement): NonNullable<typeof landingGuard> | null {
+  if (!landingGuard) return null;
+  if (landingGuard.video !== v || Date.now() > landingGuard.until || !isLive(v)) {
+    landingGuard = null;
+    return null;
+  }
+  return landingGuard;
+}
+
+/** Is the playhead where playback from the guarded position could have taken it by now? */
+function isOnLanding(v: HTMLVideoElement, guard: NonNullable<typeof landingGuard>): boolean {
+  const played = ((Date.now() - guard.seenAt) / 1000) * Math.max(1, v.playbackRate);
+  return v.currentTime >= guard.position - LANDING_TOLERANCE && v.currentTime <= guard.position + played + LANDING_TOLERANCE;
+}
+
+/** Runs on every tick: follows the playhead for as long as it simply plays on (or stays paused). */
+function trackLanding(v: HTMLVideoElement): void {
+  const guard = activeLandingGuard(v);
+  if (!guard || v.seeking || !isOnLanding(v, guard)) return;
+  guard.position = v.currentTime;
+  guard.seenAt = Date.now();
+}
+
+/**
+ * 'seeked' while the guard is armed. A seek that took the playhead somewhere
+ * playback could not have reached is the player's late seek to its slider
+ * position (the user's own seeks disarm the guard first), so it is undone.
+ */
+function checkLanding(): void {
+  if (!video) return;
+  const guard = activeLandingGuard(video);
+  if (!guard || isOnLanding(video, guard)) return;
+  if (guard.corrections >= LANDING_MAX_CORRECTIONS) {
+    landingGuard = null;
+    return;
+  }
+  guard.corrections++;
+  guard.seenAt = Date.now();
+  const edge = liveEdge(video) ?? video.currentTime;
+  console.warn(`${LOG_PREFIX} the player moved the playhead to ${(edge - video.currentTime).toFixed(0)} s behind live after the switch; seeking back to ${(edge - guard.position).toFixed(0)} s behind`);
+  video.currentTime = guard.position;
+}
+
+/** Is the player on the plain live stream (as opposed to the 3 h time-shift stream)? */
+function onPlainLiveStream(v: HTMLVideoElement): boolean {
+  return isLive(v) && v.seekable.length > 0 && v.seekable.end(0) - v.seekable.start(0) < 1000;
+}
+
+/** 'pause' on the plain live stream: unless it is a brief tap, move the position to the time-shift stream. */
+function schedulePauseSwitch(): void {
+  cancelPauseSwitch();
+  if (!video || !onPlainLiveStream(video)) return;
+  pauseSwitchTimer = window.setTimeout(() => {
+    pauseSwitchTimer = null;
+    if (!video || !video.paused || pausedAt === null || !onPlainLiveStream(video)) return;
+    const behindLive = (estimatedLiveEdge(video) ?? video.seekable.end(0)) - pausedAt;
+    console.info(`${LOG_PREFIX} still paused after ${PAUSE_TO_TIME_SHIFT_MS / 1000} s on the plain live stream (${behindLive.toFixed(0)} s behind live); moving to the time-shift stream so the position survives the pause`);
+    void switchToTimeShift(behindLive);
+  }, PAUSE_TO_TIME_SHIFT_MS);
+}
+
+function cancelPauseSwitch(): void {
+  if (pauseSwitchTimer === null) return;
+  clearTimeout(pauseSwitchTimer);
+  pauseSwitchTimer = null;
 }
 
 // --- Time to the end / live edge --------------------------------------------
@@ -328,6 +697,26 @@ function isLive(v: HTMLVideoElement): boolean {
 function liveEdge(v: HTMLVideoElement): number | null {
   const ranges = v.seekable.length;
   return ranges > 0 ? v.seekable.end(ranges - 1) : null;
+}
+
+/**
+ * The player moves the seekable end in whole segments (3.84 s on ČT), so a
+ * raw reading can be stale by up to a segment. The edge is therefore tracked
+ * against wall-clock time: it grows one second per second between steps.
+ */
+let edgeTrack: { value: number; wall: number } | null = null;
+
+function trackLiveEdge(v: HTMLVideoElement): void {
+  const edge = liveEdge(v);
+  if (edge === null) return;
+  if (!edgeTrack || edge > edgeTrack.value + 0.01) edgeTrack = { value: edge, wall: Date.now() };
+}
+
+function estimatedLiveEdge(v: HTMLVideoElement): number | null {
+  const edge = liveEdge(v);
+  if (edge === null) return null;
+  trackLiveEdge(v);
+  return edgeTrack ? Math.max(edge, edgeTrack.value + (Date.now() - edgeTrack.wall) / 1000) : edge;
 }
 
 /**
@@ -390,12 +779,18 @@ function formatCountdown(seconds: number): string {
  * (the player switched between the two stream flavours).
  */
 function updateLiveWindow(v: HTMLVideoElement): void {
-  if (!isLive(v) || v.paused || v.seekable.length === 0) return;
+  if (!isLive(v) || v.seekable.length === 0) return;
 
   const start = v.seekable.start(0);
   const raw = v.seekable.end(v.seekable.length - 1) - start;
+  // A stream switch (plain ↔ time-shift) is unmistakable even while paused.
+  if (liveWindow === null || Math.abs(raw - liveWindow) > 60) {
+    liveWindow = raw;
+    return;
+  }
+  if (v.paused) return;
   const unmasked = v.buffered.length > 0 && v.buffered.start(0) > start + 1;
-  if (unmasked || liveWindow === null || Math.abs(raw - liveWindow) > 60) liveWindow = raw;
+  if (unmasked) liveWindow = raw;
 }
 
 /**
@@ -417,6 +812,7 @@ function pauseBudget(v: HTMLVideoElement): number | null {
 function startPauseTicker(): void {
   if (pauseTicker !== null) return;
   pauseTicker = window.setInterval(() => {
+    if (video) trackLiveEdge(video);
     renderEta();
     renderBuffer();
   }, 1000);
@@ -434,14 +830,50 @@ function describe(v: HTMLVideoElement): string {
   return `position ${v.currentTime.toFixed(1)} s, window ${start} – ${edge} s`;
 }
 
+/**
+ * 'play' / 'pause' while a stream switch is pending. If it follows a real
+ * click or key press made after the switch began, the user did it, and that
+ * is the state the switch has to end in rather than the one it started from.
+ * The player's own play() after it has loaded the new stream follows no
+ * gesture, and the key press that started the switch came before it, so
+ * neither changes anything.
+ */
+function noteUserPlayState(paused: boolean): void {
+  if (!pendingTimeShift) return;
+  if (lastUserGesture <= pendingTimeShift.startedAt || Date.now() - lastUserGesture > USER_GESTURE_MS) return;
+  pendingTimeShift.wantedPaused = paused;
+}
+
+/**
+ * The sites are single-page apps: going to another channel keeps this script
+ * running and often the <video> element too. A paused position, a pending
+ * resume or a stream switch from the previous page must not act on the new one.
+ */
+function dropLiveStateOnNavigation(): void {
+  if (location.pathname === livePath) return;
+  livePath = location.pathname;
+  pausedAt = null;
+  resumeGuard = null;
+  pendingTimeShift = null;
+  landingGuard = null;
+  userWentLive = false;
+  cancelPauseSwitch();
+  if (settleTimer !== null) {
+    clearTimeout(settleTimer);
+    settleTimer = null;
+  }
+}
+
 /** 'pause': remember where the user stopped and start the countdown. */
 function onLivePause(): void {
+  noteUserPlayState(true);
   if (!video || !isLive(video)) return;
   pausedAt = video.currentTime;
   pausedWall = Date.now();
   resumeGuard = null;
   userWentLive = false;
   console.info(`${LOG_PREFIX} paused live stream: ${describe(video)}`);
+  schedulePauseSwitch();
 }
 
 /** 'seeking' while paused: the user moved the slider, so that is the new remembered position. */
@@ -452,6 +884,9 @@ function onLiveSeeking(): void {
 
 /** 'play': arm the guard with the remembered position and log what the resume starts from. */
 function onLivePlay(): void {
+  noteUserPlayState(false);
+  cancelPauseSwitch();
+  dropLiveStateOnNavigation();
   if (!video || pausedAt === null || !isLive(video)) return;
   const elapsed = Math.round((Date.now() - pausedWall) / 1000);
   console.info(`${LOG_PREFIX} resuming after ${elapsed} s: remembered ${pausedAt.toFixed(1)} s, ${describe(video)}`);
@@ -461,6 +896,9 @@ function onLivePlay(): void {
 
 /** 'emptied' / 'loadstart' while paused or resuming: the player reloaded the stream. */
 function onLiveReload(event: Event): void {
+  dropLiveStateOnNavigation();
+  edgeTrack = null;
+  landingGuard = null; // positions on the old stream mean nothing on the new one
   const remembered = pausedAt ?? resumeGuard?.remembered;
   if (remembered === undefined || remembered === null) return;
   console.info(`${LOG_PREFIX} stream reloaded (${event.type}) while resuming from ${remembered.toFixed(1)} s`);
@@ -474,6 +912,7 @@ function onLiveReload(event: Event): void {
  * still available, seek back.
  */
 function checkLiveResume(event: Event): void {
+  dropLiveStateOnNavigation();
   if (!video || !resumeGuard || !isLive(video)) return;
 
   if (Date.now() > resumeGuard.until) {
@@ -505,8 +944,11 @@ function checkLiveResume(event: Event): void {
 
 /** Clicks on the player's "live" button are honoured; any other click in the player after a resume disarms the guard. */
 function onDocumentClick(event: Event): void {
-  if (pausedAt === null && !resumeGuard) return;
+  if (event.isTrusted) lastUserGesture = Date.now();
+  if (pausedAt === null && !resumeGuard && !landingGuard) return;
   const target = event.target instanceof Element ? event.target : null;
+  // A click in the player right after a stream switch is the user moving on.
+  if (target?.closest(PLAYER_SELECTOR)) landingGuard = null;
   if (target?.closest(LIVE_BUTTON_SELECTOR)) {
     userWentLive = true;
   } else if (resumeGuard && target?.closest(PLAYER_SELECTOR)) {
@@ -519,11 +961,23 @@ function onDocumentClick(event: Event): void {
  * keys seek in the player) disarms the resume guard too.
  */
 function onDocumentKeydown(event: KeyboardEvent): void {
+  if (event.isTrusted) lastUserGesture = Date.now();
   resumeGuard = null;
+  landingGuard = null;
 
-  if (!video || event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) return;
+  if (!video || event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event)) return;
+  // Shift with an arrow key extends a text selection; that stays with the page.
+  if (event.shiftKey && event.key.startsWith("Arrow")) return;
+
+  const seek = SEEK_KEYS[event.key] ?? SEEK_KEYS[event.key.toLowerCase()];
+  if (seek !== undefined) {
+    event.preventDefault();
+    event.stopPropagation(); // the player's own arrow-key seek would run and be clamped
+    seekBy(seek);
+    return;
+  }
+
   if (event.key !== FRAME_BACK_KEY && event.key !== FRAME_FORWARD_KEY) return;
-
   event.preventDefault();
   event.stopPropagation();
   stepFrame(event.key === FRAME_FORWARD_KEY ? 1 : -1);
@@ -546,7 +1000,7 @@ function createControls(): Controls {
 
   const bar = document.createElement("div");
   bar.id = BAR_ID;
-  bar.title = `${name} v${version} – keys: ${FRAME_BACK_KEY} / ${FRAME_FORWARD_KEY} step one frame back / forward`;
+  bar.title = `${name} v${version} – keys: J / L seek ${SEEK_LARGE_SECONDS} s, ← / → seek ${SEEK_SMALL_SECONDS} s, ${FRAME_BACK_KEY} / ${FRAME_FORWARD_KEY} step one frame`;
   bar.style.cssText = `
     position: fixed !important;
     left: 16px !important;
@@ -562,6 +1016,16 @@ function createControls(): Controls {
   const playPause = createButton(LABELS.play.text, "Play / pause", () => {
     void togglePlayback();
   });
+
+  const seekGroup = document.createElement("span");
+  seekGroup.style.cssText = `
+    display: none !important;
+    align-items: center !important;
+    gap: 6px !important;
+  `;
+  const back = createButton(`« ${SEEK_LARGE_SECONDS} s`, `Back ${SEEK_LARGE_SECONDS} s (J; ← = ${SEEK_SMALL_SECONDS} s)`, () => seekBy(-SEEK_LARGE_SECONDS));
+  const forward = createButton(`${SEEK_LARGE_SECONDS} s »`, `Forward ${SEEK_LARGE_SECONDS} s (L; → = ${SEEK_SMALL_SECONDS} s)`, () => seekBy(SEEK_LARGE_SECONDS));
+  seekGroup.append(back, forward);
 
   const speedGroup = document.createElement("span");
   speedGroup.style.cssText = `
@@ -584,8 +1048,8 @@ function createControls(): Controls {
   buffer.style.cssText = LABEL_STYLE;
   setDisplay(buffer, "none");
 
-  bar.append(playPause, speedGroup, eta, buffer);
-  return { bar, playPause, speedGroup, slower, rate, faster, eta, buffer };
+  bar.append(playPause, seekGroup, speedGroup, eta, buffer);
+  return { bar, playPause, seekGroup, speedGroup, slower, rate, faster, eta, buffer };
 }
 
 // Only touch the DOM when something changed, so our own updates don't
@@ -626,7 +1090,8 @@ function render(): void {
   if (hasVideo && !playing) startPauseTicker();
   else stopPauseTicker();
 
-  // Speed can only be changed once there is a <video> to apply it to.
+  // Seeking and speed need a <video> to act on.
+  setDisplay(controls.seekGroup, hasVideo ? "inline-flex" : "none");
   setDisplay(controls.speedGroup, hasVideo ? "inline-flex" : "none");
   setText(controls.rate, formatRate(rate));
   setDisabled(controls.slower, rate <= RATE_MIN);
@@ -735,8 +1200,10 @@ function renderBuffer(): void {
 
 function onTick(): void {
   if (video) {
+    trackLiveEdge(video);
     updateLiveWindow(video);
     sampleFrameRate(video);
+    trackLanding(video);
   }
   renderEta();
   renderBuffer();
@@ -750,6 +1217,13 @@ const LIVE_LISTENERS: ReadonlyArray<[string, (event: Event) => void]> = [
   ["play", onLivePlay],
   ["playing", checkLiveResume],
   ["seeked", checkLiveResume],
+  ["loadedmetadata", onTimeShiftEvent],
+  ["canplay", onTimeShiftEvent],
+  ["seeked", onTimeShiftEvent],
+  ["playing", onTimeShiftEvent],
+  // The player's seeks after a switch can supersede one another, so that only 'seeking' fires in between.
+  ["seeking", onTimeShiftEvent],
+  ["seeked", checkLanding],
   ["emptied", onLiveReload],
   ["loadstart", onLiveReload],
 ];
@@ -765,12 +1239,14 @@ function attachVideo(next: HTMLVideoElement | null): void {
     video.removeEventListener("seeking", resetFrameRateWindow);
     stopPauseTicker();
     stopFrameTracking(video);
+    cancelPauseSwitch();
   }
 
   // A new <video> element keeps a pending resume (the app may swap elements
-  // while reloading the stream) but needs its own window measurement.
+  // while reloading the stream) but needs its own window and edge measurements.
   video = next;
   liveWindow = null;
+  edgeTrack = null;
 
   if (video) {
     for (const [event, listener] of LIVE_LISTENERS) video.addEventListener(event, listener);
@@ -815,3 +1291,11 @@ new MutationObserver(scheduleSync).observe(document.documentElement, {
 });
 document.addEventListener("click", onDocumentClick, true);
 document.addEventListener("keydown", onDocumentKeydown, true);
+// A drag on the player's slider seeks before any click event arrives.
+document.addEventListener(
+  "pointerdown",
+  (event) => {
+    if (landingGuard && event.target instanceof Element && event.target.closest(PLAYER_SELECTOR)) landingGuard = null;
+  },
+  true,
+);

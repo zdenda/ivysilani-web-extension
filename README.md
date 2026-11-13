@@ -22,10 +22,13 @@ Current features – a floating control bar in the bottom-left corner of the pag
   label spells it out. The estimate ignores ads, and once a live stream reaches the edge
   the player has to wait for the broadcast, so expect it to stall there.
 
-- **Pause budget on live streams**: ČT live streams can be rewound only within a sliding
-  window (about 76 s on the plain live stream, 3 h once you have rewound). While paused,
-  the bar counts down how long your paused position stays inside that window
-  (`resume within 1:23:45`), then shows `position expired`.
+- **Pauses that survive on live streams**: ČT live streams can be rewound only within a
+  sliding window (about 76 s on the plain live stream, 3 h once you have rewound), so on
+  the plain stream a pause of more than a minute loses its position. A pause longer than
+  3 s on the plain stream therefore moves the paused position to the 3 h time-shift stream
+  (the same slider trick as above), after which a resume lands exactly where you paused for
+  up to about 3 hours. While paused, the bar counts down how long the position stays inside
+  the window (`resume within 2:58:27`), then shows `position expired`.
 - **Resume guard on live streams**: the player remembers where you paused and seeks back
   there on resume, but if that position has left the window it clamps to the oldest
   available point, and sometimes it ends up at live. If the player lands well ahead of
@@ -42,6 +45,13 @@ Current features – a floating control bar in the bottom-left corner of the pag
   buffer can only hold what already exists: at the live edge there is nothing ahead to
   fetch, so this helps time-shifted and on-demand playback, not watching live at the edge.
 
+- **Seeking that works on live streams**: `« 10 s` / `10 s »` buttons, the `J` / `L` keys
+  (10 s) and `←` / `→` (5 s), as on YouTube. The player's own skip button and arrow keys
+  seek 10 s but are silently clamped about 67 s behind live, because the plain live stream
+  keeps only ~75 s and only the (coarse, ~20 s per pixel) slider loads the 3 h time-shift
+  stream. The extension seeks the video directly inside the window and, for a rewind that
+  would leave it, clicks the player's slider from script to switch streams, then seeks to
+  the exact point; the paused state is preserved.
 - **Frame stepping**: the `,` and `.` keys move one frame back / forward, as on YouTube.
   If the video is playing it is paused first. The frame rate is measured from the frames
   the browser decodes (25 fps is assumed until a couple of seconds have played).
@@ -134,6 +144,33 @@ harmless warning about it on the extensions page.
   derived from the live edge (`seekable.end − window`) instead. The pause budget is
   `pausedPosition − 5 s − windowStart` (5 s is shaka's `safeSeekOffset`, where it lands
   when the playhead is outside the window).
+- Seeking on a live stream: a forward seek is capped 3 s before the live edge; a backward
+  seek whose target is above `windowStart + 5 s + 1 s` is applied to the `<video>` directly
+  (shaka clamps anything below `windowStart + safeSeekOffset`). Otherwise the script makes
+  the player render its controls (they are not in the DOM while hidden): it sends a
+  synthetic `mousemove` to the overlay that covers the picture, which is a sibling of the
+  `<video>` and is found by hit-testing the middle of the picture, because a content script
+  cannot see the page's React props; if the player is scrolled out of view, every leaf
+  element of the player gets the event instead. Then it clicks
+  the slider track at `1 − max(behind + 120 s, 250 s) / 3 h` with synthetic pointer and mouse
+  events (the player rounds the slider to whole percent and treats 99 % as "still live", so
+  a request must land at 98 % or less),
+  and on the first `playing` of the time-shift stream (seekable span > 1000 s) seeks to
+  `seekable.end − behind`, re-pausing if the video was paused. `behind` is anchored to
+  wall-clock time (it grows while the switch takes its few seconds), and the live edge is
+  tracked against wall-clock time too, because the player moves `seekable.end` in whole
+  3.84 s segments. "Seconds behind live" is the
+  same quantity on both streams, which is what makes the precise seek possible (measured
+  with the player's own content clock, the landing is within one 3.84 s segment of the
+  exact point on both ČT24 and ČT1, and a miss lands early, so nothing is skipped). A pause on
+  the plain stream that lasts 3 s schedules the same switch with the paused position, so
+  the time-shift stream's 3 h window, not the plain stream's 75 s, decides how long a pause
+  may last. The player's own seek to the slider position normally comes before the precise
+  seek, but under load it can arrive after it and undo it. For 8 s after the precise seek
+  the script therefore follows the playhead, and a `seeked` that leaves it somewhere
+  playback could not have reached is undone (at most twice). A key press, a click or a
+  pointer press in the player, or the bar's own seek buttons disarm this, so a deliberate
+  seek is never fought.
 - Frame stepping measures the frame rate from the decoded-frame counter
   (`getVideoPlaybackQuality().totalVideoFrames`) over two seconds of playback, snapped to a
   common rate; it counts every frame however rarely a throttled tab paints. Frames sit on a

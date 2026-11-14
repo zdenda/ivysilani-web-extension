@@ -24,6 +24,40 @@ const STATUS_DATASET_KEY = "ivysilaniExtBuffer";
 
 const SEARCH_INTERVAL_MS = 500;
 
+// --- One copy at a time ------------------------------------------------------
+//
+// When the extension is reloaded or updated, Firefox runs its content scripts
+// again in the tabs that are already open. A script in the isolated world is
+// torn down together with the old extension, but this one runs in the page's
+// own world, where its timers, listeners and hooks live on. The old copy and
+// the new one would then both act on the same player, and wherever the two
+// versions behave differently they would work against each other. So every
+// copy announces itself when it starts, and a copy that finds a later
+// announcement stops acting.
+
+/** Where the copies of this script in one page leave the id of the latest one. */
+const LATEST_COPY_KEY = Symbol.for("ivysilani-web-extension/page/latest-copy");
+const COPY_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const copyRegistry = globalThis as unknown as Record<symbol, unknown>;
+copyRegistry[LATEST_COPY_KEY] = COPY_ID;
+
+/** What stops this copy's timers and listeners. Its hooks stay in place and pass every call through. */
+const stoppers: Array<() => void> = [];
+let retired = false;
+
+/**
+ * Is this still the latest copy in the page? Everything that acts asks first;
+ * the first "no" also stops this copy's timers and listeners.
+ */
+function inCharge(): boolean {
+  if (retired) return false;
+  if (copyRegistry[LATEST_COPY_KEY] === COPY_ID) return true;
+  retired = true;
+  for (const stop of stoppers.splice(0)) stop();
+  console.info(`${LOG_PREFIX} a newer copy of this script has taken over, this one has stopped`);
+  return false;
+}
+
 /** The subset of the shaka.Player API this script relies on (duck-typed, never imported). */
 interface PlayerLike {
   configure(config: unknown, value?: unknown): unknown;
@@ -155,18 +189,18 @@ function installHooks(cls: PlayerClass, how: string): void {
   const originalGetConfiguration = proto.getConfiguration;
 
   proto.load = function (this: PlayerLike, ...args: unknown[]): Promise<unknown> {
-    applyTo(this, `${how}; on stream load`);
+    if (inCharge()) applyTo(this, `${how}; on stream load`);
     return originalLoad.apply(this, args);
   };
 
   proto.configure = function (this: PlayerLike, config: unknown, value?: unknown): unknown {
     const result = originalConfigure.call(this, config, value);
-    if (!applying && touchesBufferingGoal(config, value)) applyTo(this, `${how}; re-asserted after the page reconfigured it`);
+    if (inCharge() && !applying && touchesBufferingGoal(config, value)) applyTo(this, `${how}; re-asserted after the page reconfigured it`);
     return result;
   };
 
   proto.getConfiguration = function (this: PlayerLike) {
-    noteInstance(this, `${how}; existing instance`);
+    if (inCharge()) noteInstance(this, `${how}; existing instance`);
     return originalGetConfiguration.call(this);
   };
 
@@ -253,8 +287,10 @@ function findViaWebpack(): PlayerClass | null {
   return null;
 }
 
-const TURBOPACK_PROBE_CHUNK = "ivysilani-ext-probe.js";
-const TURBOPACK_PROBE_MODULE = "ivysilani-ext-probe";
+// The runtime runs a module only once, so every copy of this script (see "One
+// copy at a time") needs a probe under a name of its own.
+const TURBOPACK_PROBE_MODULE = `ivysilani-ext-probe-${COPY_ID}`;
+const TURBOPACK_PROBE_CHUNK = `${TURBOPACK_PROBE_MODULE}.js`;
 let turbopackContext: TurbopackContext | null = null;
 let turbopackProbePushed = false;
 const turbopackScanned = new Set<unknown>();
@@ -497,13 +533,13 @@ function checkRateMenu(): void {
   for (const video of document.querySelectorAll("video")) mirrorRate(video);
 }
 
-function onRateEvent(event: Event): void {
-  const target = event.target;
-  if (!(target instanceof HTMLVideoElement)) return;
+/** Mirrors the video's speed now and again a little later (see RATE_MIRROR_DELAYS_MS). */
+function scheduleMirror(video: HTMLVideoElement): void {
   for (const delay of RATE_MIRROR_DELAYS_MS) {
     window.setTimeout(() => {
+      if (!inCharge()) return;
       try {
-        mirrorRate(target);
+        mirrorRate(video);
       } catch (error) {
         if (rateMirrorLogged) return;
         rateMirrorLogged = true;
@@ -513,17 +549,30 @@ function onRateEvent(event: Event): void {
   }
 }
 
+function onRateEvent(event: Event): void {
+  if (event.target instanceof HTMLVideoElement && inCharge()) scheduleMirror(event.target);
+}
+
 // Media events do not bubble, but a capturing listener on the document sees
 // them for every <video>, including players the page creates later.
-for (const type of RATE_MIRROR_EVENTS) document.addEventListener(type, onRateEvent, true);
+for (const type of RATE_MIRROR_EVENTS) {
+  document.addEventListener(type, onRateEvent, true);
+  stoppers.push(() => document.removeEventListener(type, onRateEvent, true));
+}
 
-window.setInterval(() => {
+// A copy that starts in a page that is already playing (see "One copy at a
+// time") puts right whatever the copy before it left in the menu.
+for (const video of document.querySelectorAll("video")) scheduleMirror(video);
+
+const rateMenuTimer = window.setInterval(() => {
+  if (!inCharge()) return;
   try {
     checkRateMenu();
   } catch {
     // The list assumed so far stays in use.
   }
 }, RATE_MENU_CHECK_MS);
+stoppers.push(() => window.clearInterval(rateMenuTimer));
 
 // --- Main ---------------------------------------------------------------------
 
@@ -560,6 +609,7 @@ let searchErrorLogged = false;
 
 /** One failing pass must never stop the search; the error is logged once. */
 function safeSearch(): void {
+  if (!inCharge()) return;
   try {
     search();
   } catch (error) {
@@ -576,4 +626,5 @@ publish({ active: false, goal: null, wanted: BUFFER_GOAL_SECONDS, how: "looking 
 // create new players as you navigate. Each pass is cheap once the registry
 // has been scanned.
 safeSearch();
-window.setInterval(safeSearch, SEARCH_INTERVAL_MS);
+const searchTimer = window.setInterval(safeSearch, SEARCH_INTERVAL_MS);
+stoppers.push(() => window.clearInterval(searchTimer));

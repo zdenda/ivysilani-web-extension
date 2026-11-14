@@ -1358,7 +1358,13 @@ function attachVideo(next: HTMLVideoElement | null): void {
 
 /** Makes sure the controls are mounted and bound to the player currently on the page. */
 function sync(): void {
-  if (!controls) controls = createControls();
+  if (!controls) {
+    // When the extension is reloaded or updated, Firefox runs this script
+    // again in the tabs that are already open. The earlier copy is gone by
+    // then, but the bar it built is still in the page, and nothing drives it.
+    document.getElementById(BAR_ID)?.remove();
+    controls = createControls();
+  }
   if (!controls.bar.isConnected) (document.body ?? document.documentElement).appendChild(controls.bar);
 
   attachVideo(findVideo());

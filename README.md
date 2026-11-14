@@ -93,6 +93,9 @@ npm run typecheck    # run tsc without emitting (esbuild does not type-check)
 
 Easiest: `npm run firefox`. This builds and uses Mozilla's `web-ext` tool to open a
 fresh Firefox profile with the extension loaded; it reloads when `dist/` changes.
+Firefox then also runs the new build in the tabs that are already open. The older
+copy steps aside (see "How it works"), but what the bar remembered, such as the chosen
+speed, starts afresh, and a page reload is still the cleanest start for a test.
 
 Manually: open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** →
 pick `dist/manifest.json`.
@@ -227,6 +230,18 @@ harmless warning about it on the extensions page.
   attribute on `<html>` (read by the bar's buffer label) and logged with the prefix
   `[ivysilani-web-extension/page]`. If none of this finds a player, the bar's tooltip says
   so instead of anything breaking.
+- When the extension is reloaded or updated, Firefox runs both content scripts again in
+  the tabs that are already open (Chrome waits for the page to be reloaded). The old
+  copy of `content.ts` dies with the old extension and leaves only its bar behind, which
+  the new copy removes. `page.ts` is different: it lives in the page's own world, where
+  nothing removes its timers, listeners and hooks, so the old and the new version would
+  both act on one player and undo each other's work (the player's speed menu going
+  blank at random was how this first showed). Every copy therefore announces itself
+  under a shared `Symbol.for` key on `window`, and a copy that finds a later
+  announcement stops: it clears its timers and listeners, and its hooks on the player
+  class pass every call through. The copy that takes over hooks the class again, finds
+  the running player and puts the menu's speed right at once. Its Turbopack probe is
+  named after the copy, because that runtime runs a module only once.
 - esbuild bundles each script (and, for `content.ts`, the polyfill) into `dist/` in IIFE
   format (content scripts can't be ES modules) and copies the manifest next to it.
 

@@ -1,12 +1,17 @@
 ># 🤖 Disclaimer: Entirely vibe coded; use at your own risk
 
-# iVysílání Enhancer
+# Enhancer for iVysílání
 
-A cross-browser (Firefox + Chrome) extension written in TypeScript that improves the
-[iVysílání](https://www.ceskatelevize.cz/) video player of Česká televize. It runs only
-on `https://www.ceskatelevize.cz/` and `https://ct24.ceskatelevize.cz/`.
+An unofficial browser extension that improves the
+[iVysílání](https://www.ceskatelevize.cz/) video player of Česká televize. It is not
+affiliated with or endorsed by Česká televize. It runs only on
+`https://www.ceskatelevize.cz/` and `https://ct24.ceskatelevize.cz/`, collects nothing
+and sends nothing anywhere.
 
-Current features – a floating control bar in the bottom-left corner of the page:
+It is written for Firefox. The same build is meant to load in Chrome, Edge and Brave too,
+but it has never been tested installed there.
+
+What it adds – a floating control bar in the bottom-left corner of the page:
 
 - **Play/Pause button** that controls the player. It works on live streams (e.g.
   `/zive/ct1/`, `ct24.ceskatelevize.cz/#live`) and on video-on-demand pages
@@ -61,10 +66,59 @@ Current features – a floating control bar in the bottom-left corner of the pag
 
 The bar is hidden on pages without a player.
 
+## Install
+
+Each [release](https://github.com/zdenda/ivysilani-web-extension/releases) has the
+packaged extension attached as an `.xpi` file. Mozilla has not signed it, and that
+decides where it can be installed:
+
+- **Firefox Nightly or Developer Edition, permanently.** Open `about:config` and set
+  `xpinstall.signatures.required` to `false`. Then open `about:addons`, click the gear
+  icon, choose **Install Add-on From File…** and pick the downloaded `.xpi`.
+- **Regular Firefox, until the browser restarts.** Release and beta versions of Firefox
+  refuse unsigned extensions. Open `about:debugging#/runtime/this-firefox`, click
+  **Load Temporary Add-on…** and pick the `.xpi`.
+- **Chrome, Edge, Brave.** Build the extension from source (see below), open
+  `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and choose
+  the `dist/` folder. This has never been tested.
+
+> Firefox treats Manifest V3 host permissions as optional. If the control bar doesn't show
+> up, click the puzzle-piece **Extensions** button in the toolbar, find the extension,
+> and allow it on the site (or "Always allow on ceskatelevize.cz").
+
+## Privacy
+
+The extension makes no network requests, stores nothing, and reads nothing beyond the
+player on the two ČT sites. Its manifest declares to Firefox that it collects no data.
+What it does is logged to the page's browser console with the prefix
+`[ivysilani-web-extension]`.
+
+## Known limits
+
+- The bar's seek buttons, keys and speed also work on the pre-roll spot that plays
+  before a programme.
+- It works only on `www.ceskatelevize.cz` and `ct24.ceskatelevize.cz`, not on other ČT
+  sites and not on players embedded elsewhere.
+- It depends on how ČT's player is built today. When the player changes, parts of the
+  extension may stop working until it is updated.
+- The bar sits in the bottom-left corner of the window. Where the player reaches the
+  bottom of the window, the bar can cover the player's own buttons in that corner.
+- The keys (`J`, `L`, the arrow keys, `,` and `.`) are taken on the whole page whenever a
+  player is present, except while typing in a field. There is no switch to turn them off.
+- The bar is not shown in fullscreen.
+- The interface is in English only.
+- The 120 s buffer makes the player download further ahead, which uses more data on a
+  metered connection.
+
+## Licence
+
+© 2026 Zdeněk Kořán. All rights reserved. You may install and use the extension for
+personal use.
+
+## Build from source
+
 Stack: TypeScript, [`webextension-polyfill`](https://github.com/mozilla/webextension-polyfill),
 [esbuild](https://esbuild.github.io/), Manifest V3.
-
-## Project layout
 
 ```
 ivysilani-web-extension/
@@ -74,22 +128,20 @@ ivysilani-web-extension/
 ├── src/
 │   ├── manifest.json    # extension manifest (copied to dist/ as-is)
 │   ├── content.ts       # content script (isolated world): the control bar
-│   └── page.ts          # content script (page world): raises the player's buffer
-└── dist/                # build output – this is what you load into the browser
+│   └── page.ts          # content script (page world): buffer size, the player's speed menu
+├── dist/                # build output – this is what you load into the browser
+└── web-ext-artifacts/   # the packaged .xpi
 ```
 
-## Setup
-
 ```bash
-npm install
+npm ci
 npm run build        # one-off build into dist/
 npm run watch        # rebuild on every change
 npm run typecheck    # run tsc without emitting (esbuild does not type-check)
+npm run package      # build and pack web-ext-artifacts/enhancer-for-ivysilani-<version>.xpi
 ```
 
-## Load it in a browser
-
-### Firefox
+### Develop in Firefox
 
 Easiest: `npm run firefox`. This builds and uses Mozilla's `web-ext` tool to open a
 fresh Firefox profile with the extension loaded; it reloads when `dist/` changes.
@@ -100,11 +152,7 @@ speed, starts afresh, and a page reload is still the cleanest start for a test.
 Manually: open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** →
 pick `dist/manifest.json`.
 
-> Firefox treats Manifest V3 host permissions as optional. If the control bar doesn't show
-> up, click the puzzle-piece **Extensions** button in the toolbar, find the extension,
-> and allow it on the site (or "Always allow on ceskatelevize.cz").
-
-### Chrome / Edge / Brave
+### Develop in Chrome / Edge / Brave
 
 Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and
 choose the `dist/` folder. After each rebuild, click the reload icon on the
@@ -118,13 +166,14 @@ harmless warning about it on the extensions page.
 - `content_scripts[].matches` and `host_permissions` are limited to
   `https://www.ceskatelevize.cz/*` and `https://ct24.ceskatelevize.cz/*`, so the extension
   never runs anywhere else.
-- `browser_specific_settings.gecko.id` gives the extension a stable ID in Firefox
-  (needed for signing and for APIs like `storage.sync`). Change it to something of your
-  own before publishing.
+- `browser_specific_settings.gecko.id` gives the extension a stable ID in Firefox. It
+  must stay the same in every later version, signed or not.
 - `browser_specific_settings.gecko.data_collection_permissions` is required by Firefox
   for new extensions. `{"required": ["none"]}` declares that the extension collects no
-  data. Because this key only exists since Firefox 142, `strict_min_version` is set to
-  `142.0`; the manifest passes `web-ext lint` with zero warnings.
+  data. Firefox supports this key from version 140 on desktop and 142 on Android, so
+  `strict_min_version` is set to `142.0`; the manifest passes `web-ext lint` with zero
+  warnings.
+- `minimum_chrome_version` is `120`, the version the build targets.
 
 ## How it works
 
@@ -178,11 +227,17 @@ harmless warning about it on the extensions page.
   `<video>` and is found by hit-testing the middle of the picture, because a content script
   cannot see the page's React props; if the player is scrolled out of view, every leaf
   element of the player gets the event instead. Then it clicks
-  the slider track at `1 − max(behind + 120 s, 250 s) / 3 h` with synthetic pointer and mouse
+  the timeline (of the player's sliders the widest; the volume control is one too) at
+  `1 − max(behind + 120 s, 250 s) / 3 h` with synthetic pointer and mouse
   events (the player rounds the slider to whole percent and treats 99 % as "still live", so
-  a request must land at 98 % or less),
-  and on the first `playing` of the time-shift stream (seekable span > 1000 s) seeks to
-  `seekable.end − behind`, re-pausing if the video was paused. `behind` is anchored to
+  a request must land at 98 % or less). The events go to the part of the timeline under
+  that point, looked up by position when something else lies on top of it, so that
+  nothing but the timeline ever receives the click. Once the time-shift stream (seekable
+  span > 1000 s) has settled, the script seeks to
+  `seekable.end − behind` and restores the paused or playing state. If the user plays or
+  pauses while the switch is under way (a `play` or `pause` event within a second of a
+  real click or key press made after the switch began), that is the state it ends in;
+  the player's own `play()` after the reload follows no such gesture. `behind` is anchored to
   wall-clock time (it grows while the switch takes its few seconds), and the live edge is
   tracked against wall-clock time too, because the player moves `seekable.end` in whole
   3.84 s segments. "Seconds behind live" is the
@@ -202,8 +257,9 @@ harmless warning about it on the extensions page.
   common rate; it counts every frame however rarely a throttled tab paints. Frames sit on a
   regular grid, so any media time reported by `requestVideoFrameCallback` – even a stale one –
   fixes the grid's phase, and a step seeks to the middle of the neighbouring frame on that
-  grid, which cannot land on a boundary. Key presses in text fields or with modifiers are
-  ignored.
+  grid, which cannot land on a boundary. Key presses in text fields (also inside a shadow
+  tree) or with Ctrl, Alt or Meta are ignored, and so is Shift with an arrow key, which
+  extends a text selection.
 - The resume guard is armed on the `play` event after a pause and checks every `playing`
   and `seeked` event for the next 10 s, because the player settles in steps (seek to the
   remembered position, then clamp to the window, sometimes a stream reload). The expected
@@ -214,7 +270,9 @@ harmless warning about it on the extensions page.
 - Both sites are single-page apps and the `<video>` element appears and disappears as
   you navigate (on video-on-demand pages it is only created after the poster's
   "Přehrát video" button is clicked). A `MutationObserver` watches the DOM and
-  re-attaches the controls to whichever player is currently on the page.
+  re-attaches the controls to whichever player is currently on the page. A paused
+  position, a pending resume or a pending stream switch is dropped when the page path
+  changes, so that it cannot act on the next channel.
 - `src/page.ts` is a second content script declared with `"world": "MAIN"`, so it runs in
   the page's own JavaScript world (Chrome, and Firefox since 128) where the player library
   lives. It locates the player class without depending on one page build: first a global
@@ -222,7 +280,12 @@ harmless warning about it on the extensions page.
   www.ceskatelevize.cz), then the Turbopack chunk registry (`self.TURBOPACK`, used by
   ct24.ceskatelevize.cz). Both registries accept a probe chunk that hands the script the
   bundler's require function and module tables, from which it recognises the player module
-  by its source. It
+  by its source. A probe is pushed only once the bundler's runtime has replaced the
+  registry's `push` with its own function. Before that the registry is a plain array in
+  which chunks queue up for the runtime to work through while the page loads, and a probe
+  in that queue could stop the page from loading if the site ever changed the registry
+  format; pushed afterwards, it is handled inside the script's own call, where a failure
+  only ends the search. It
   then hooks the class: every instance gets `streaming.bufferingGoal = 120` on each
   `load()`, the setting is re-asserted if the page's own `configure()` call touches it,
   and instances that existed before the hooks are found through the page's debugging
@@ -244,9 +307,3 @@ harmless warning about it on the extensions page.
   named after the copy, because that runtime runs a module only once.
 - esbuild bundles each script (and, for `content.ts`, the polyfill) into `dist/` in IIFE
   format (content scripts can't be ES modules) and copies the manifest next to it.
-
-## Next steps
-
-Typical additions: a background script (`background.scripts` in Firefox,
-`background.service_worker` in Chrome), a popup (`action.default_popup`), or an options
-page – each is just another entry point in `build.mjs` plus a manifest entry.

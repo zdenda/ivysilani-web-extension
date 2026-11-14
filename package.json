@@ -1,15 +1,21 @@
 {
   "name": "ivysilani-web-extension",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Browser extension that improves the iVysílání video player on ceskatelevize.cz.",
+  "description": "Unofficial browser extension that improves the iVysílání video player of Česká televize.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zdenda/ivysilani-web-extension.git"
+  },
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
     "typecheck": "tsc --noEmit",
     "firefox": "npm run build && npx web-ext run --source-dir dist",
-    "lint:firefox": "npm run build && npx web-ext lint --source-dir dist"
+    "lint:firefox": "npm run build && npx web-ext lint --source-dir dist",
+    "package": "npm run build && npx web-ext build --source-dir dist --filename \"enhancer-for-ivysilani-{version}.xpi\" --overwrite-dest"
   },
   "devDependencies": {
     "@types/webextension-polyfill": "^0.12.1",

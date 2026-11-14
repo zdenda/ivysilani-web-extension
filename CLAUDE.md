@@ -35,8 +35,11 @@ There are no automated tests; say what was verified on the live sites and what w
 - **Commit only when the owner asks**, after the change has been verified.
 - **Never rewrite published history.** Everything on `origin/main` is public. Fixes to
   released features are new commits.
-- **Changes reach `main` through a branch and a pull request** with a green Build run.
-  Merge by fast-forward so the commits land unchanged.
+- **Ask where finished work goes.** When a change is done and verified, ask the owner
+  whether to commit it straight to `main` or to open a pull request. Not everything
+  needs a pull request.
+- **Pull requests are merged by rebase**, never with a merge commit or a squash, so that
+  `main` stays a straight line of one commit per feature.
 - **Pushing, tagging and releasing need the owner's go-ahead** each time. Pushing a tag
   like `v1.2.3` publishes a release by itself.
 - **Anything an agent posts to GitHub says so.** Issues and pull requests created by an

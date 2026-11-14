@@ -218,6 +218,16 @@ let pausedWall = 0;
 /** Armed on resume: the position to get back to, until when to watch for a jump, and whether the verdict was logged. */
 let resumeGuard: { remembered: number; until: number; reported: boolean } | null = null;
 
+/**
+ * Set when the player reloads the stream under a paused position or a pending
+ * resume. The new stream may be the other flavour with another timeline (after
+ * a pause of about an hour the player came back on the plain live stream,
+ * whose positions are tens of thousands of seconds away from the time-shift
+ * stream's), so the remembered position means nothing on it. What survives is
+ * how far behind live it was at a given wall-clock moment.
+ */
+let reloadedUnderPause: { behindLive: number; wall: number } | null = null;
+
 /** Set when the user clicks the player's "live" button while paused. */
 let userWentLive = false;
 
@@ -932,6 +942,7 @@ function dropLiveStateOnNavigation(): void {
   livePath = location.pathname;
   pausedAt = null;
   resumeGuard = null;
+  reloadedUnderPause = null;
   pendingTimeShift = null;
   landingGuard = null;
   userWentLive = false;
@@ -949,6 +960,7 @@ function onLivePause(): void {
   pausedAt = video.currentTime;
   pausedWall = Date.now();
   resumeGuard = null;
+  reloadedUnderPause = null;
   userWentLive = false;
   console.info(`${LOG_PREFIX} paused live stream: ${describe(video)}`);
   schedulePauseSwitch();
@@ -957,6 +969,8 @@ function onLivePause(): void {
 /** 'seeking' while paused: the user moved the slider, so that is the new remembered position. */
 function onLiveSeeking(): void {
   if (!video || pausedAt === null || !video.paused) return;
+  // After a reload the player seeks by itself while it settles; those are not the user's moves.
+  if (reloadedUnderPause) return;
   pausedAt = video.currentTime;
 }
 
@@ -975,11 +989,45 @@ function onLivePlay(): void {
 /** 'emptied' / 'loadstart' while paused or resuming: the player reloaded the stream. */
 function onLiveReload(event: Event): void {
   dropLiveStateOnNavigation();
+  const lastEdge = edgeTrack;
   edgeTrack = null;
   landingGuard = null; // positions on the old stream mean nothing on the new one
   const remembered = pausedAt ?? resumeGuard?.remembered;
   if (remembered === undefined || remembered === null) return;
+  // Only the first event of a reload still knows the old stream's live edge.
+  if (lastEdge && !reloadedUnderPause && !pendingTimeShift) {
+    reloadedUnderPause = { behindLive: lastEdge.value - remembered, wall: lastEdge.wall };
+  }
   console.info(`${LOG_PREFIX} stream reloaded (${event.type}) while resuming from ${remembered.toFixed(1)} s`);
+}
+
+/**
+ * The resume after the player reloaded the stream: go to the same distance
+ * behind live as the paused position, on whichever stream the player is on
+ * now. Returns false while the new stream is not ready yet.
+ */
+function resumeAfterReload(v: HTMLVideoElement, lost: NonNullable<typeof reloadedUnderPause>): boolean {
+  const edge = estimatedLiveEdge(v);
+  if (edge === null) return false;
+  const behindLive = lost.behindLive + (Date.now() - lost.wall) / 1000;
+  reloadedUnderPause = null;
+  resumeGuard = null;
+
+  const target = edge - behindLive;
+  const floor = v.seekable.start(0) + LIVE_SAFE_OFFSET + 1;
+  if (onPlainLiveStream(v) && target < floor) {
+    console.warn(`${LOG_PREFIX} the player reloaded the stream during the pause and came back ${(edge - v.currentTime).toFixed(0)} s behind live; the paused position is ${behindLive.toFixed(0)} s behind`);
+    void switchToTimeShift(behindLive);
+    return true;
+  }
+  const wanted = Math.max(target, floor);
+  if (Math.abs(v.currentTime - wanted) <= RESUME_JUMP_TOLERANCE) {
+    console.info(`${LOG_PREFIX} resumed ${(edge - v.currentTime).toFixed(0)} s behind live after a reload (expected ≈ ${behindLive.toFixed(0)} s), fine`);
+    return true;
+  }
+  console.warn(`${LOG_PREFIX} resume after a reload landed ${(edge - v.currentTime).toFixed(0)} s behind live, expected ≈ ${behindLive.toFixed(0)} s; seeking there`);
+  v.currentTime = wanted;
+  return true;
 }
 
 /**
@@ -995,11 +1043,17 @@ function checkLiveResume(event: Event): void {
 
   if (Date.now() > resumeGuard.until) {
     resumeGuard = null;
+    reloadedUnderPause = null;
     return;
   }
   if (userWentLive) {
     console.info(`${LOG_PREFIX} resumed via the live button, leaving the player alone`);
     resumeGuard = null;
+    reloadedUnderPause = null;
+    return;
+  }
+  if (reloadedUnderPause) {
+    resumeAfterReload(video, reloadedUnderPause);
     return;
   }
 
@@ -1027,6 +1081,11 @@ function onDocumentClick(event: Event): void {
   const target = event.target instanceof Element ? event.target : null;
   // A click in the player right after a stream switch is the user moving on.
   if (target?.closest(PLAYER_SELECTOR)) landingGuard = null;
+  // A real click on the timeline of a reloaded, still paused stream is the user choosing a new position.
+  if (event.isTrusted && reloadedUnderPause && pausedAt !== null && target && findTimeline()?.contains(target)) {
+    reloadedUnderPause = null;
+    pausedAt = null;
+  }
   if (target?.closest(LIVE_BUTTON_SELECTOR)) {
     userWentLive = true;
   } else if (resumeGuard && target?.closest(PLAYER_SELECTOR)) {

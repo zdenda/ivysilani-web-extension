@@ -1,0 +1,58 @@
+name: Release
+
+# Publishes a GitHub release for every version tag (v1.2.3). It builds the
+# tagged commit with the same checks as the Build workflow, which here also
+# make sure the tag names the version in the manifest, and attaches the .xpi.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # to create the release
+
+jobs:
+  release:
+    name: Package and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the release notes list the commits since the previous tag
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - run: npm run package
+
+      - name: Write the release notes
+        run: |
+          previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          range="$GITHUB_REF_NAME"
+          if [ -n "$previous" ]; then range="$previous..$GITHUB_REF_NAME"; fi
+          {
+            echo "## Changes"
+            echo
+            git log --reverse --format='- %s' "$range"
+            echo
+            echo "How to install the attached \`.xpi\` is described in the [README]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY#install)."
+          } > release-notes.md
+          cat release-notes.md
+
+      # A release that already exists for the tag (a re-run, or one made by
+      # hand) keeps its text and only gets the package replaced.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" web-ext-artifacts/*.xpi --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" web-ext-artifacts/*.xpi --title "${GITHUB_REF_NAME#v}" --notes-file release-notes.md --verify-tag
+          fi

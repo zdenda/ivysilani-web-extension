@@ -122,9 +122,12 @@ Stack: TypeScript, [`webextension-polyfill`](https://github.com/mozilla/webexten
 
 ```
 ivysilani-web-extension/
+├── .github/workflows/   # GitHub Actions: build every commit, publish tagged releases
 ├── build.mjs            # esbuild script (bundle + copy manifest into dist/)
 ├── package.json
 ├── tsconfig.json
+├── scripts/
+│   └── check-version.mjs  # manifest, package.json and release tag must agree
 ├── src/
 │   ├── manifest.json    # extension manifest (copied to dist/ as-is)
 │   ├── content.ts       # content script (isolated world): the control bar
@@ -138,8 +141,30 @@ npm ci
 npm run build        # one-off build into dist/
 npm run watch        # rebuild on every change
 npm run typecheck    # run tsc without emitting (esbuild does not type-check)
+npm run check        # version numbers, typecheck and web-ext lint, as CI runs them
 npm run package      # build and pack web-ext-artifacts/enhancer-for-ivysilani-<version>.xpi
 ```
+
+### Builds and releases on GitHub
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- **Build** runs for every commit pushed to `main` and for every pull request. It runs
+  `npm run check` and `npm run package` and keeps the `.xpi` with the run: open the run
+  under the repository's *Actions* tab and download it from the *Artifacts* section.
+  GitHub asks for a login there and deletes artifacts after 90 days.
+- **Release** runs for every tag of the form `v1.2.3`. It builds the tagged commit the
+  same way, refuses to go on if the tag does not name the version in the manifest, and
+  publishes a GitHub release with the `.xpi` attached. The release text lists the titles
+  of the commits since the previous tag and can be edited on GitHub afterwards.
+
+To release a new version:
+
+1. Set `version` in `src/manifest.json`.
+2. Run `npm version <version> --no-git-tag-version`, which sets the same version in
+   `package.json` and `package-lock.json`.
+3. Commit, then tag the commit: `git tag -a v<version> -m "Version <version>"`.
+4. Push both: `git push origin main v<version>`.
 
 ### Develop in Firefox
 

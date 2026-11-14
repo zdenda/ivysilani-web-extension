@@ -13,6 +13,7 @@
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
     "typecheck": "tsc --noEmit",
+    "check": "node scripts/check-version.mjs && npm run typecheck && npm run lint:firefox",
     "firefox": "npm run build && web-ext run --source-dir dist",
     "lint:firefox": "npm run build && web-ext lint --source-dir dist --warnings-as-errors",
     "package": "npm run build && web-ext build --source-dir dist --filename \"enhancer-for-ivysilani-{version}.xpi\" --overwrite-dest"

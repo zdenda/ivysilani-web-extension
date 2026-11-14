@@ -41,7 +41,10 @@ What it adds – a floating control bar in the bottom-left corner of the page:
   there on resume, but if that position has left the window it clamps to the oldest
   available point, and sometimes it ends up at live. If the player lands well ahead of
   the paused position although an older one is still available, the extension seeks
-  back to the paused position (or to the oldest available point). Resuming through the
+  back to the paused position (or to the oldest available point). After a pause of
+  about 45 minutes or more the player reloads the stream and comes back on the plain
+  live stream, a few seconds behind live; the extension then switches to the time-shift
+  stream again and goes to the moment where you paused. Resuming through the
   player's own "ŽIVĚ" button is left alone. Every pause/resume on a live stream is logged
   to the browser console (prefix `[ivysilani-web-extension]`) so that a bad resume can
   be diagnosed.

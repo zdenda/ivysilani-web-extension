@@ -1,6 +1,6 @@
 {
   "name": "ivysilani-web-extension",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Unofficial browser extension that improves the iVysílání video player of Česká televize.",
   "license": "UNLICENSED",

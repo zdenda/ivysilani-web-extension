@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Enhancer for iVysílání",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Unofficial add-on for Česká televize's iVysílání player: speed control, seeking on live streams, lasting pauses, a bigger buffer.",
   "homepage_url": "https://github.com/zdenda/ivysilani-web-extension",
   "minimum_chrome_version": "120",

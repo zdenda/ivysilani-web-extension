@@ -2,8 +2,10 @@
 //
 // Runs in the page's own JavaScript world (manifest `"world": "MAIN"`), not in
 // the isolated content-script world, because the video player library lives
-// in the page's module scope. Its single job: ask the player to buffer further
-// ahead than its default 10 s, so that short network outages pass unnoticed.
+// in the page's module scope. It has two jobs: ask the player to buffer further
+// ahead than its default 10 s, so that short network outages pass unnoticed,
+// and keep the speed shown in the player's own settings menu equal to the
+// speed the <video> element really plays at (see "The speed the player shows").
 //
 // Nothing here depends on one particular page build. The player class is
 // located through several independent strategies (a global, the webpack
@@ -367,6 +369,161 @@ function findInstance(value: unknown, cls: PlayerClass, visited: Set<unknown>, d
   // React hooks form a linked list through `next`, which Object.keys covers.
   return null;
 }
+
+// --- The speed the player shows -------------------------------------------------
+//
+// The player keeps the speed it *shows* in its settings menu in React state (a
+// context value with `playbackRate` and `setPlaybackRate`), separate from the
+// <video> element's real `playbackRate`. Its menu sets both; anything else –
+// the extension's speed buttons, or the extension restoring the speed after
+// the player reset it – only changes the element, and the menu then shows a
+// stale value. Copying the element's rate into that state after every change
+// keeps the menu truthful, whoever changed the speed. Setting the state has no
+// effect on playback: the player never copies it back to the element.
+//
+// The state only ever gets a speed the menu lists. The menu ignores a click
+// on any of its entries unless one of them is currently marked as chosen, so
+// a speed it does not list (the bar goes up to 3×, the menu to 2×) would
+// leave it dead until the bar brought the speed back into its range. For
+// such a speed the menu is given its nearest entry instead.
+
+const RATE_MIRROR_EVENTS = ["ratechange", "loadedmetadata", "playing"] as const;
+
+/**
+ * The mirror runs right after such an event and again a little later: React
+ * commits state asynchronously, and while a stream (re)loads the player puts
+ * its own value back to 1 at a moment of its choosing.
+ */
+const RATE_MIRROR_DELAYS_MS = [0, 250, 1500];
+
+/** The part of the player's React context this script relies on (duck-typed). */
+interface RateContext {
+  playbackRate: number;
+  setPlaybackRate(rate: number): unknown;
+}
+
+function isRateContext(value: unknown): value is RateContext {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate["playbackRate"] === "number" && typeof candidate["setPlaybackRate"] === "function";
+}
+
+/**
+ * Walks up React's fiber tree from the <video> to the nearest context
+ * provider whose value carries the playback rate. React keeps two copies of
+ * every fiber (the current one and the previous render) and the way up may
+ * pass through either, so both values are returned.
+ */
+function findRateContexts(video: Element): RateContext[] {
+  const fiberKey = Object.keys(video).find((k) => k.startsWith("__reactFiber$"));
+  if (!fiberKey) return [];
+  let fiber = (video as unknown as Record<string, unknown>)[fiberKey] as Record<string, unknown> | null;
+  for (let depth = 0; fiber && depth < 100; depth++, fiber = fiber["return"] as Record<string, unknown> | null) {
+    const found: RateContext[] = [];
+    for (const copy of [fiber, fiber["alternate"] as Record<string, unknown> | null]) {
+      const props = copy?.["memoizedProps"];
+      const value = props && typeof props === "object" ? (props as Record<string, unknown>)["value"] : null;
+      if (isRateContext(value)) found.push(value);
+    }
+    if (found.length > 0) return found;
+  }
+  return [];
+}
+
+/**
+ * The speeds the player's menu lists. These are today's; whenever the menu
+ * is on screen the list is read from it again (see checkRateMenu), so a
+ * change on the site corrects itself the first time the menu is opened.
+ */
+let listedRates = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
+/** How often to look whether the player's speed menu is on screen. */
+const RATE_MENU_CHECK_MS = 500;
+
+/** A menu entry such as "1.25x"; the normal speed is written in words instead. */
+const RATE_LABEL = /^(\d+(?:[.,]\d+)?)\s*[x×]$/i;
+
+/** The listed speed closest to the real one: the real one itself whenever the menu has it. */
+function shownRateFor(rate: number): number {
+  return listedRates.reduce((best, listed) => (Math.abs(listed - rate) < Math.abs(best - rate) ? listed : best));
+}
+
+/**
+ * Reads the speeds from the player's settings dialog while its speed list is
+ * on screen: a list whose entries are all speeds like "1.25x", except at
+ * most one written in words, which is the normal speed. Recognising the list
+ * by its content keeps this independent of the page's class names and ids.
+ */
+function readListedRates(): number[] | null {
+  for (const list of document.querySelectorAll('[role="dialog"] ul')) {
+    const labels = [...list.children].map((item) => item.textContent?.trim() ?? "");
+    const rates = labels.flatMap((label) => {
+      const match = RATE_LABEL.exec(label);
+      return match?.[1] ? [Number(match[1].replace(",", "."))] : [];
+    });
+    if (rates.length < 3 || labels.length - rates.length > 1) continue;
+    if (rates.length < labels.length) rates.push(1);
+    return [...new Set(rates)].filter((rate) => rate > 0).sort((a, b) => a - b);
+  }
+  return null;
+}
+
+let rateMirrorLogged = false;
+
+function mirrorRate(video: HTMLVideoElement): void {
+  if (!video.isConnected) return;
+  const rate = video.playbackRate;
+  // 0 is the player library holding playback while it buffers, not a speed.
+  if (!(rate > 0)) return;
+
+  const contexts = findRateContexts(video);
+  if (!rateMirrorLogged && contexts.length > 0) {
+    rateMirrorLogged = true;
+    console.info(`${LOG_PREFIX} keeping the speed shown in the player's menu in step with the real playback speed`);
+  }
+  const shown = shownRateFor(rate);
+  // If either copy disagrees, the current one may; setting a value the state
+  // already has is a no-op for React, so there is no harm in a spare call.
+  const stale = contexts.find((context) => context.playbackRate !== shown);
+  stale?.setPlaybackRate(shown);
+}
+
+/** Learns the menu's speeds while it is on screen and re-mirrors if they differ from the ones assumed. */
+function checkRateMenu(): void {
+  const rates = readListedRates();
+  if (!rates || rates.join() === listedRates.join()) return;
+  listedRates = rates;
+  console.info(`${LOG_PREFIX} the player's menu lists the speeds ${rates.join(", ")}`);
+  for (const video of document.querySelectorAll("video")) mirrorRate(video);
+}
+
+function onRateEvent(event: Event): void {
+  const target = event.target;
+  if (!(target instanceof HTMLVideoElement)) return;
+  for (const delay of RATE_MIRROR_DELAYS_MS) {
+    window.setTimeout(() => {
+      try {
+        mirrorRate(target);
+      } catch (error) {
+        if (rateMirrorLogged) return;
+        rateMirrorLogged = true;
+        console.warn(`${LOG_PREFIX} could not update the speed shown in the player's menu:`, error);
+      }
+    }, delay);
+  }
+}
+
+// Media events do not bubble, but a capturing listener on the document sees
+// them for every <video>, including players the page creates later.
+for (const type of RATE_MIRROR_EVENTS) document.addEventListener(type, onRateEvent, true);
+
+window.setInterval(() => {
+  try {
+    checkRateMenu();
+  } catch {
+    // The list assumed so far stays in use.
+  }
+}, RATE_MENU_CHECK_MS);
 
 // --- Main ---------------------------------------------------------------------
 

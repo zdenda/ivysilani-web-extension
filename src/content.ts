@@ -43,6 +43,12 @@ const VIDEO_STATE_EVENTS = ["play", "playing", "pause", "ended", "emptied", "rat
  */
 const VIDEO_RATE_RESET_EVENTS = ["loadedmetadata", "playing"] as const;
 
+/** Events that start a (re)load of the stream, during which that reset happens. */
+const VIDEO_RELOAD_EVENTS = ["emptied", "loadstart"] as const;
+
+/** How long a change to 1× must last, with no reload following, to count as a choice. */
+const RATE_DEFAULT_CONFIRM_MS = 2000;
+
 /** Events that only move the ETA label; they fire several times a second while playing. */
 const VIDEO_TICK_EVENTS = ["timeupdate", "durationchange"] as const;
 
@@ -190,8 +196,17 @@ const BUFFER_STATUS_DATASET_KEY = "ivysilaniExtBuffer";
 let video: HTMLVideoElement | null = null;
 let controls: Controls | null = null;
 
-/** The speed the user asked for; re-applied whenever the player resets it. */
+/**
+ * The speed the user asked for, through this bar or through the player's own
+ * settings menu; re-applied whenever the player resets it.
+ */
 let desiredRate = RATE_DEFAULT;
+
+/** True from a (re)load of the stream until playback starts again. */
+let rateResetPending = false;
+
+/** Running while a change to 1× waits to be confirmed as a choice (see onRateChange). */
+let defaultRateTimer: number | null = null;
 
 /** Length of the live stream's time-shift window in seconds, measured while playing. */
 let liveWindow: number | null = null;
@@ -313,11 +328,74 @@ function applyDesiredRate(): void {
 
 /** Restores the user's speed after the player reset it; leaves the player alone at 1×. */
 function reapplyDesiredRate(): void {
+  // While a change to 1× waits to be confirmed as a choice, the speed is left alone.
+  if (defaultRateTimer !== null) return;
   if (desiredRate !== RATE_DEFAULT) applyDesiredRate();
+}
+
+function cancelDefaultRateConfirmation(): void {
+  if (defaultRateTimer === null) return;
+  clearTimeout(defaultRateTimer);
+  defaultRateTimer = null;
+}
+
+function onStreamReload(): void {
+  rateResetPending = true;
+  // A 1× seen just before this was the player's reset, not a choice.
+  cancelDefaultRateConfirmation();
+}
+
+function onRateRestore(event: Event): void {
+  // A speed picked in the player's menu just now counts even if this event
+  // overtook its `ratechange`; without this the pick would be undone below.
+  onRateChange();
+  reapplyDesiredRate();
+  if (event.type === "playing") rateResetPending = false;
+}
+
+/**
+ * Follows a speed that something other than this bar has set, in practice the
+ * player's own settings menu, so that the bar's steps and the re-application
+ * after a reset continue from it. (The other direction, the player's menu
+ * showing a speed set here, is page.ts's job.)
+ *
+ * Any speed but 1× can only be a deliberate choice and is adopted at once.
+ * 1× is ambiguous: it is what "normal speed" in the menu sets, and also what
+ * the browser and the player library put back whenever a stream is reloaded
+ * or the player is torn down – the library even does so a moment *before*
+ * the reload becomes visible. So 1× during a reload is ignored (that is the
+ * reset this script undoes), and 1× outside one is adopted only after it has
+ * lasted RATE_DEFAULT_CONFIRM_MS with no reload and no new player.
+ */
+function onRateChange(): void {
+  if (!video) return;
+  const rate = video.playbackRate;
+  // 0 is the player library holding playback while it buffers, not a speed.
+  if (!(rate > 0)) return;
+  if (rate !== RATE_DEFAULT) cancelDefaultRateConfirmation();
+  if (rate === desiredRate) return;
+  if (rate !== RATE_DEFAULT) {
+    desiredRate = rate;
+    return;
+  }
+
+  if (rateResetPending || video.readyState === 0 || defaultRateTimer !== null) return;
+  const changed = video;
+  defaultRateTimer = window.setTimeout(() => {
+    defaultRateTimer = null;
+    const stillChosen =
+      video === changed &&
+      changed.isConnected &&
+      !rateResetPending &&
+      changed.readyState > 0 &&
+      changed.playbackRate === RATE_DEFAULT;
+    if (stillChosen) desiredRate = RATE_DEFAULT;
+  }, RATE_DEFAULT_CONFIRM_MS);
 }
 
 function setRate(rate: number): void {
   desiredRate = clampRate(rate);
+  cancelDefaultRateConfirmation();
   applyDesiredRate();
   render();
 }
@@ -1038,6 +1116,15 @@ function createControls(): Controls {
     setRate(RATE_DEFAULT),
   );
   const faster = createButton("+", `Faster (+${RATE_STEP}×)`, () => setRate(currentRate() + RATE_STEP));
+  // Wide enough for the longest label ("0.25×") so that − and + stay put
+  // while the speed changes. (`font` in BUTTON_STYLE resets the numeric
+  // variant, so it has to be set afterwards.)
+  rate.style.cssText += `
+    box-sizing: border-box !important;
+    min-width: calc(5ch + 24px) !important;
+    justify-content: center !important;
+    font-variant-numeric: tabular-nums !important;
+  `;
   speedGroup.append(slower, rate, faster);
 
   const eta = document.createElement("span");
@@ -1234,13 +1321,18 @@ function attachVideo(next: HTMLVideoElement | null): void {
   if (video) {
     for (const [event, listener] of LIVE_LISTENERS) video.removeEventListener(event, listener);
     for (const event of VIDEO_STATE_EVENTS) video.removeEventListener(event, render);
-    for (const event of VIDEO_RATE_RESET_EVENTS) video.removeEventListener(event, reapplyDesiredRate);
+    video.removeEventListener("ratechange", onRateChange);
+    for (const event of VIDEO_RELOAD_EVENTS) video.removeEventListener(event, onStreamReload);
+    for (const event of VIDEO_RATE_RESET_EVENTS) video.removeEventListener(event, onRateRestore);
     for (const event of VIDEO_TICK_EVENTS) video.removeEventListener(event, onTick);
     video.removeEventListener("seeking", resetFrameRateWindow);
     stopPauseTicker();
     stopFrameTracking(video);
     cancelPauseSwitch();
   }
+
+  // A 1× the old player was left at is its teardown, not a choice.
+  cancelDefaultRateConfirmation();
 
   // A new <video> element keeps a pending resume (the app may swap elements
   // while reloading the stream) but needs its own window and edge measurements.
@@ -1250,10 +1342,15 @@ function attachVideo(next: HTMLVideoElement | null): void {
 
   if (video) {
     for (const [event, listener] of LIVE_LISTENERS) video.addEventListener(event, listener);
+    // Registered before the render listeners so that render() sees the adopted speed.
+    video.addEventListener("ratechange", onRateChange);
+    for (const event of VIDEO_RELOAD_EVENTS) video.addEventListener(event, onStreamReload);
     for (const event of VIDEO_STATE_EVENTS) video.addEventListener(event, render);
-    for (const event of VIDEO_RATE_RESET_EVENTS) video.addEventListener(event, reapplyDesiredRate);
+    for (const event of VIDEO_RATE_RESET_EVENTS) video.addEventListener(event, onRateRestore);
     for (const event of VIDEO_TICK_EVENTS) video.addEventListener(event, onTick);
     video.addEventListener("seeking", resetFrameRateWindow);
+    // A player that has not started playing yet is still inside its load.
+    rateResetPending = video.readyState === 0 || video.paused;
     reapplyDesiredRate();
     startFrameTracking(video);
   }

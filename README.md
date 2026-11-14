@@ -15,7 +15,10 @@ Current features – a floating control bar in the bottom-left corner of the pag
 - **Playback speed** controls: `−` / `+` change the speed in 0.25× steps (0.25×–3×) and
   clicking the speed label resets it to 1×. The chosen speed survives the player's own
   resets (e.g. the switch from the pre-roll ad to the programme) and navigation between
-  episodes.
+  episodes. The bar and the player's own speed setting (*Nastavení → Rychlost přehrávání*
+  on archive videos) show the same value: a speed set in either place appears in both. The
+  player's menu only knows 0.25×–2×, so for the bar's faster speeds it shows 2×, its
+  nearest entry, and stays usable.
 - **Time to the end / live edge** label: while playing, the bar shows when playback reaches
   the end of the programme at the current speed (`ends 21:47 · 23 min`), or – on a live
   stream above 1× – when it catches up with the live edge (`live in 1:04`). Hovering the
@@ -132,6 +135,26 @@ harmless warning about it on the extensions page.
   `<video>` element (pre-roll ad → programme). The script remembers the speed you chose
   and re-applies it on `loadedmetadata` / `playing`, and whenever it attaches to a new
   `<video>` element. At 1× it leaves the player alone.
+- The player keeps the speed it *shows* in its settings menu in React state (a context
+  value with `playbackRate` / `setPlaybackRate`), separate from the `<video>` element's real
+  rate: its menu sets both, the bar only the element. Two small rules keep them together.
+  `src/page.ts` copies the element's rate into that state after every `ratechange`,
+  `loadedmetadata` and `playing` (the player also puts its own value back to 1 on each
+  reload), so the menu always shows the real speed; the state is found by walking React's
+  fiber tree up from the `<video>`, and setting it never touches playback. The state only
+  ever gets a speed the menu lists: the menu ignores a click on its entries unless one of
+  them is marked as chosen, so a speed outside its list would leave it dead. For such a
+  speed it gets the nearest listed one. The list is today's (0.25×–2×) and is read again
+  from the menu whenever its speed list is on screen, recognised by its labels ("1.25x"),
+  so a change on the site corrects itself the first time the menu is opened. `src/content.ts`
+  adopts any speed it did not set itself as "the speed you chose", so a pick in the
+  player's menu is what the bar steps from and what gets re-applied later. The one
+  ambiguous value is 1×: it is what *Normální* in the menu sets, and also what the browser
+  and the player library put back when a stream is reloaded or the player is torn down
+  (the library does so a moment *before* the reload becomes visible). So 1× during a
+  reload is the reset that gets undone, and 1× outside one counts as a choice only once
+  it has lasted 2 s with no reload and no new player. A rate of 0 (the player library
+  holding playback while it buffers) is ignored by both scripts.
 - The ETA label is computed from the `<video>` element alone and refreshed on every
   `timeupdate`. Video on demand: `(duration − currentTime) / playbackRate`. Live streams
   report `duration === Infinity`; their live edge is the end of `video.seekable`, the

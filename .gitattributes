@@ -1,0 +1,5 @@
+# Check text files out with LF line endings on every system. The bundler
+# normalises line endings in the scripts, but src/manifest.json is copied into
+# the package as it is, so without this its line endings, and with them the
+# package, would depend on the system it was built on.
+* text=auto eol=lf

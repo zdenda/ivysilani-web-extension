@@ -92,6 +92,13 @@ Practical details:
   twice, then `loadedmetadata`. It becomes paused without a `pause` event. If it was
   playing, the player calls `play()` about two seconds later. In the tests it did not
   start playing by itself when it had been paused.
+- **A long pause ends on the plain live stream.** After pauses of 46, 55 and 82 minutes on
+  the time-shift stream the player reloaded the stream by itself (`emptied` and
+  `loadstart` twice, as in a stream switch) and resumed on the plain live stream, a few
+  seconds behind live. The two streams count time differently (about 11 000 s on one,
+  about 70 000 s on the other at the same moment), so a position remembered on one
+  means nothing on the other; only the distance behind live carries over. Whether the
+  reload happens during the pause or at the press of play is not known.
 - **The player's keys.** Its own arrow keys seek 10 s. They also worked with the focus
   outside the player and with Shift held. On the plain live stream that seek is clamped
   about 67 s behind live.
@@ -109,6 +116,11 @@ Practical details:
   within one 3.84 s segment of the exact point and errs on the early side.
 - Pauses of 20 s and of 10 min resumed at the paused position in tests. The owner
   confirmed a longer pause by hand.
+- A pause of 82 minutes on ČT1 live, 32 minutes behind live, resumed 6849 s behind live
+  where 6846 s was expected, after the extension switched back to the time-shift stream.
+  A pause of 46 minutes on ČT24 live, 16 minutes behind live, resumed 3699 s behind live
+  where 3697 s was expected. The owner ran both tests; the numbers are from the console
+  logs.
 - On a page without a player, `page.ts` scans the bundler's modules once (5 to 9 ms for
   about 700 to 850 modules) and then costs about 0.2 ms per half-second tick. These
   numbers come from a code audit made before 1.0.0.

@@ -123,6 +123,9 @@ Stack: TypeScript, [`webextension-polyfill`](https://github.com/mozilla/webexten
 ```
 ivysilani-web-extension/
 ├── .github/workflows/   # GitHub Actions: build every commit, publish tagged releases
+├── CLAUDE.md            # guide for AI coding agents
+├── docs/
+│   └── development-notes.md  # testing against the real player, player facts, traps
 ├── build.mjs            # esbuild script (bundle + copy manifest into dist/)
 ├── package.json
 ├── tsconfig.json
@@ -201,6 +204,10 @@ harmless warning about it on the extensions page.
 - `minimum_chrome_version` is `120`, the version the build targets.
 
 ## How it works
+
+How to test a change against the real player, what is known about the player, and the
+traps met so far are in [docs/development-notes.md](docs/development-notes.md).
+[CLAUDE.md](CLAUDE.md) is the short guide for AI coding agents working on this repository.
 
 - `src/content.ts` is declared as a content script in `src/manifest.json`, so it runs on
   every page of the two domains once the DOM is ready.
